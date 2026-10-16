@@ -1,1 +1,21 @@
-{"name":"Ministerio de Alabanza","short_name":"Alabanza","start_url":"./","display":"standalone","background_color":"#f3f7fc","theme_color":"#102c45","icons":[{"src":"icon.svg","sizes":"any","type":"image/svg+xml","purpose":"any maskable"}]}
+
+{
+  "name": "Ministerio de Alabanza Yahweh",
+  "short_name": "Alabanza Yahweh",
+  "description": "Biblioteca de alabanzas, letras, acordes y repertorios del Ministerio de Alabanza Yahweh.",
+  "id": "./",
+  "start_url": "./",
+  "scope": "./",
+  "display": "standalone",
+  "background_color": "#f3f6fb",
+  "theme_color": "#102c45",
+  "lang": "es",
+  "icons": [
+    {
+      "src": "icon.svg",
+      "sizes": "any",
+      "type": "image/svg+xml",
+      "purpose": "any"
+    }
+  ]
+}
