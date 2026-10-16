@@ -334,6 +334,69 @@ async function getFileBlob(path) {
   return blob;
 }
 
+// --- PASO 39: Encabezados y letras escritas manualmente ---
+const LYRIC_HEADINGS = new Map([
+  ['INTRO','intro'], ['INTRODUCCION','intro'],
+  ['CORO','coro'], ['ESTRIBILLO','coro'],
+  ['INSTRUMENTAL','instrumental'], ['INTERLUDIO','instrumental'],
+  ['VERSO','verso'], ['ESTROFA','verso'], ['PUENTE','puente'],
+  ['PRE CORO','puente'], ['PRECORO','puente'], ['FINAL','final']
+]);
+function lyricHeadingClass(text) {
+  const key = normalize(text).replace(/\s*[:：.\-–]\s*$/, '').replace(/\s+/g, ' ').toUpperCase();
+  return LYRIC_HEADINGS.get(key) || '';
+}
+function lyricLinesHtml(text) {
+  return String(text || '').replace(/\r\n?/g, '\n').split('\n').map(line => {
+    const kind = lyricHeadingClass(line);
+    return `<p class="lyric-line ${kind ? 'lyric-part lyric-' + kind : ''}">${escapeHtml(line) || '&nbsp;'}</p>`;
+  }).join('');
+}
+// Colorea únicamente los párrafos que son títulos de sección completos.
+function markWordHeadings(container) {
+  container.querySelectorAll('p').forEach(p => {
+    const kind = lyricHeadingClass(p.textContent);
+    if (kind && !p.querySelector('img')) p.classList.add('lyric-part', 'lyric-' + kind);
+  });
+}
+function manualLyricsViewer(song) {
+  const s = songs.find(x => x.id === song);
+  if (!s?.contenidoTexto?.trim()) { toast('Esta canción todavía no tiene una letra escrita.'); return; }
+  let size = 19, dark = false;
+  modal(s.name + ' — Letra', `
+    <div class="row" style="margin-bottom:12px">
+      <button class="btn secondary small" id="manual-less">A−</button>
+      <button class="btn secondary small" id="manual-more">A+</button>
+      <button class="btn secondary small" id="manual-dark">🌙 Modo oscuro</button>
+      <button class="btn secondary small" id="manual-full">⛶ Pantalla completa</button>
+    </div>
+    <div class="manual-lyric-page" id="manual-lyric-page">
+      <div class="lyric-doves"><span aria-hidden="true">🕊️</span><span aria-hidden="true">🕊️</span></div>
+      <h2 class="lyric-title">${escapeHtml(s.name)}</h2>
+      <div class="lyric-body">${lyricLinesHtml(s.contenidoTexto)}</div>
+    </div>`, { wide: true });
+  const overlay = document.getElementById('overlay');
+  const page = overlay.querySelector('#manual-lyric-page');
+  const update = () => { page.style.fontSize = size + 'px'; page.classList.toggle('dark', dark); };
+  overlay.querySelector('#manual-less').onclick = () => { size = Math.max(12,size-2); update(); };
+  overlay.querySelector('#manual-more').onclick = () => { size = Math.min(36,size+2); update(); };
+  overlay.querySelector('#manual-dark').onclick = () => { dark = !dark; update(); };
+  overlay.querySelector('#manual-full').onclick = async () => {
+    try { if (!document.fullscreenElement) await page.requestFullscreen(); else await document.exitFullscreen(); }
+    catch (e) { toast('Pantalla completa no disponible en este dispositivo.'); }
+  };
+  update();
+}
+function updateLyricsPreview() {
+  const field = document.getElementById('song-manual-text');
+  const title = document.querySelector('#song-form [name="name"]');
+  const preview = document.getElementById('song-manual-preview');
+  if (!preview || !field) return;
+  preview.innerHTML = `<div class="lyric-doves"><span>🕊️</span><span>🕊️</span></div>
+    <h3 class="lyric-title">${escapeHtml(title?.value || 'NOMBRE DE LA CANCIÓN')}</h3>
+    <div class="lyric-body">${lyricLinesHtml(field.value)}</div>`;
+}
+
 // --- UI helpers ---
 
  // --- PASO 27: Biblioteca completa sin internet ---
@@ -715,7 +778,7 @@ function biblioteca() {
 
 function songOfflineBadge(s) {
   const files = Object.values(s.files || {}).filter(Boolean);
-  if (!files.length) return '';
+  if (!files.length) return s.contenidoTexto?.trim() ? '<br><small style="color:#0b9c5b">🟢 Letra disponible sin conexión</small>' : '';
   const cached = files.some(f => offlineFiles.has(f.path));
   return cached
     ? '<br><small style="color:#0b9c5b">🟢 Disponible sin conexión</small>'
@@ -724,6 +787,7 @@ function songOfflineBadge(s) {
 
 function fileButtons(s) {
   const btns = [];
+  if (s.contenidoTexto?.trim()) btns.push(`<button class="btn secondary small" data-action="view-manual" data-id="${s.id}">🕊️ Letra</button>`);
   if (s.files?.pdf) btns.push(`<button class="btn secondary small" data-action="view-file" data-id="${s.files.pdf.id}" data-type="pdf">📄 PDF</button>`);
   if (s.files?.word) btns.push(`<button class="btn secondary small" data-action="view-file" data-id="${s.files.word.id}" data-type="word">📝 Word</button>`);
   if (s.files?.chords) btns.push(`<button class="btn secondary small" data-action="view-file" data-id="${s.files.chords.id}" data-type="pdf">🎼 Acordes</button>`);
@@ -857,7 +921,7 @@ function editService() {
   const paleta = ['#ffe5ef', '#ddf9e9', '#f0e2ff', '#ffebd9', '#e0efff', '#e8f4ff', '#fbe6e6'];
 
   shell(header(
-    'Editar ' + (isEvent ? 'evento' : 'servicio'),
+    'Editar ' + (isEvent ? 'matrimonio / evento' : 'servicio'),
     isEvent ? 'Organiza las canciones por tandas o momentos.' : 'Organiza las canciones en el orden que se interpretarán.'
   ) + `
     <section class="panel">
@@ -972,6 +1036,14 @@ function newSongModal(song) {
           <label>Tonalidad</label>
           <select name="tone">${toneOptions(s.tone)}</select>
         </div>
+        <div class="field full manual-editor">
+          <label for="song-manual-text">✍️ Escribir letra manualmente (opcional)</label>
+          <p class="hint">Puedes escribir una letra sin subir Word o PDF. La plantilla de dos palomitas aparece automáticamente al visualizarla. Escribe CORO, INTRODUCCIÓN, INSTRUMENTAL, VERSO o PUENTE en líneas independientes para colorearlas.</p>
+          <textarea id="song-manual-text" name="manualLyrics" rows="10" placeholder="INTRODUCCIÓN&#10;&#10;Escribe la letra aquí...&#10;&#10;CORO&#10;&#10;Escribe el coro aquí...">${escapeHtml(s.contenidoTexto || '')}</textarea>
+          <details class="manual-preview-wrap"><summary>👁 Vista previa con las dos palomitas</summary>
+            <div id="song-manual-preview" class="manual-lyric-page"></div>
+          </details>
+        </div>
         ${[['pdf', 'Letra PDF'], ['word', 'Letra Word'], ['chords', 'Canción con acordes (PDF) — opcional'], ['image', 'Imagen con acordes — opcional']]
           .map(([k, label]) => `<div class="field upload">
             <label>${label}</label>
@@ -992,6 +1064,7 @@ function newSongModal(song) {
   `;
 
   modal(song ? 'Editar canción' : 'Agregar nueva canción', form);
+  updateLyricsPreview();
 }
 
 function newArtistModal(artist) {
@@ -1090,7 +1163,8 @@ async function importBulk(form) {
 
 function addSongModal(section = 'Adoración') {
   const list = songs.sort((a, b) => a.name.localeCompare(b.name, 'es'));
-  modal('Agregar canción al servicio', `
+  const service = services.find(s => s.id === activeService);
+  modal(service?.type === 'evento' ? 'Agregar canción al matrimonio' : 'Agregar canción al servicio', `
     <div class="field">
       <label>Sección</label>
       <input class="input" id="section-choose" value="${escapeHtml(section)}"/>
@@ -1098,6 +1172,12 @@ function addSongModal(section = 'Adoración') {
     <div class="field">
       <label>Buscar canción</label>
       <input class="input" id="find-song" placeholder="Buscar canción..."/>
+    </div>
+    <div class="field">
+      <label for="add-song-category">Filtrar por categoría</label>
+      <select id="add-song-category"><option value="">Todas las categorías</option>
+        ${categories.slice().sort((a,b) => a.orden - b.orden).map(c => `<option value="${escapeHtml(c.nombre)}">${escapeHtml(c.nombre)}</option>`).join('')}
+      </select>
     </div>
     <div id="add-song-results">${renderAddResults(list)}</div>
     <div class="note">Si no está en la biblioteca, cierra esta ventana y utiliza «Nueva canción» para subirla.</div>
@@ -1240,6 +1320,7 @@ async function viewFile(path, type) {
             nuevo.appendChild(p);
           });
 
+          markWordHeadings(nuevo);
           return nuevo.innerHTML;
         }
 
@@ -1376,9 +1457,10 @@ async function viewFile(path, type) {
             color: ${oscuro ? '#a9c7ff' : '#1765cb'};
           }
 
-          .word-clean p:empty {
-            display: none;
-          }
+          .word-clean p:empty { display:none; }
+          .lyric-part {font-weight:800 !important; letter-spacing:.45px; margin-top:20px !important;}
+          .lyric-intro, .lyric-instrumental, .lyric-verso, .lyric-puente, .lyric-final {color:${oscuro ? '#93c5fd' : '#173b77'} !important;}
+          .lyric-coro {color:${oscuro ? '#fda4af' : '#b91c1c'} !important;}
         `;
           // El iframe aislado no ejecuta scripts del documento.
           iframe.srcdoc = `
@@ -1615,7 +1697,7 @@ async function act(action, id, section) {
 
   if (action === 'retry') { await refresh(); return; }
   if (action === 'logout') { if (!navigator.onLine) { toast('Para cerrar sesión de forma segura, reconéctate a internet.'); return; } const uid = currentUser?.id; if (supa) await supa.auth.signOut(); currentUser = null; if (uid) await clearOfflineUser(uid); songs = []; services = []; artists = []; render(); return; }
-  if (!['retry','logout','menu','close-modal','toggle-artist','view-file','download-file'].includes(action) && !requireInternet()) return;
+  if (!['retry','logout','menu','close-modal','toggle-artist','view-file','view-manual','download-file'].includes(action) && !requireInternet()) return;
   if (action === 'menu') { mobileMenu = !mobileMenu; render(); return; }
   if (action === 'new-song') { newSongModal(); return; }
   if (action === 'bulk-import') { bulkImportModal(); return; }
@@ -1628,6 +1710,7 @@ async function act(action, id, section) {
     render();
     return;
   }
+  if (action === 'view-manual') { manualLyricsViewer(id); return; }
   if (action === 'view-file') { await viewFile(id, section || 'pdf'); return; }
   if (action === 'download-file') { await downloadFile(id); return; }
 
@@ -1748,7 +1831,18 @@ document.addEventListener('click', async e => {
   if (a) await act(a.dataset.action, a.dataset.id, a.dataset.section || a.dataset.type);
 });
 
+function filterAddSongResults() {
+  const query = normalize(document.getElementById('find-song')?.value || '');
+  const category = document.getElementById('add-song-category')?.value || '';
+  const el = document.getElementById('add-song-results');
+  if (!el) return;
+  el.innerHTML = renderAddResults(songs.filter(s =>
+    (!category || s.category === category) &&
+    (!query || normalize(s.name + ' ' + artistName(s.artistId)).includes(query))
+  ).sort((a,b) => a.name.localeCompare(b.name, 'es')));
+}
 document.addEventListener('input', e => {
+  if (e.target.id === 'song-manual-text' || (e.target.name === 'name' && e.target.closest('#song-form'))) updateLyricsPreview();
   if (e.target.id === 'search') {
     const val = e.target.value;
     search = val;
@@ -1757,13 +1851,11 @@ document.addEventListener('input', e => {
     const field = document.getElementById('search');
     if (field) { field.focus(); field.setSelectionRange(pos, pos); }
   }
-  if (e.target.id === 'find-song') {
-    const el = document.getElementById('add-song-results');
-    if (el) el.innerHTML = renderAddResults(songs.filter(s => s.name.toLowerCase().includes(e.target.value.toLowerCase())));
-  }
+  if (e.target.id === 'find-song') filterAddSongResults();
 });
 
 document.addEventListener('change', async e => {
+  if (e.target.id === 'add-song-category') { filterAddSongResults(); return; }
   if (e.target.name === 'documents' && e.target.closest('#bulk-form')) {
     const n = e.target.files.length;
     const el = document.getElementById('bulk-preview');
@@ -1838,7 +1930,7 @@ document.addEventListener('submit', async e => {
     category: fd.get('category'),
     artistId: String(fd.get('artistId') || '') || null,
     tone: fd.get('tone'),
-    contenidoTexto: current?.contenidoTexto || '',
+    contenidoTexto: String(fd.get('manualLyrics') ?? current?.contenidoTexto ?? ''),
     links: {
       youtube: fd.get('youtube'),
       spotify: fd.get('spotify'),
