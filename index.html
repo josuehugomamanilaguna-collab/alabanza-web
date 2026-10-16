@@ -1,446 +1,736 @@
-
 <!DOCTYPE html>
+
 <html lang="es">
+
 <head>
+
   <meta charset="UTF-8">
+
   <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+
   <meta name="theme-color" content="#102c45">
 
   <title>Ministerio de Alabanza Yahweh</title>
 
   <!-- Aplicación instalable -->
+
   <link rel="manifest" href="manifest.webmanifest">
+
   <link rel="icon" href="icon.svg" type="image/svg+xml">
 
   <!-- Diseño principal -->
+
   <link rel="stylesheet" href="styles.css">
 
   <style>
+
     /* Recuperación de contraseña */
 
     .recover-link {
+
       display: block;
+
       margin: 14px auto 0;
+
       padding: 6px 10px;
+
       background: none;
+
       border: 0;
+
       color: #1765cb;
+
       font-size: 14px;
+
       font-weight: 700;
+
       text-decoration: underline;
+
       cursor: pointer;
+
       border-radius: 6px;
+
       transition: background .15s;
+
     }
 
     .recover-link:hover {
+
       background: #eef5ff;
+
     }
 
     .recovery-shade {
+
       position: fixed;
+
       inset: 0;
+
       z-index: 9999;
+
       background: rgba(10, 34, 58, .79);
+
       display: flex;
+
       align-items: center;
+
       justify-content: center;
+
       padding: 16px;
+
       animation: recoveryFade .18s ease-out;
+
     }
 
     @keyframes recoveryFade {
+
       from { opacity: 0; }
+
       to { opacity: 1; }
+
     }
 
     .recovery-card {
+
       width: min(430px, 100%);
+
       max-height: 95dvh;
+
       overflow: auto;
+
       padding: clamp(22px, 4vw, 36px);
+
       border-radius: 20px;
+
       background: #fff;
+
       box-shadow: 0 24px 65px rgba(0, 0, 0, .25);
+
       font-family: Inter, system-ui, -apple-system, Segoe UI, sans-serif;
+
       animation: recoveryUp .22s ease-out;
+
     }
 
     @keyframes recoveryUp {
+
       from {
+
         transform: translateY(8px);
+
         opacity: 0;
+
       }
+
       to {
+
         transform: none;
+
         opacity: 1;
+
       }
+
     }
 
     .recovery-card h2 {
+
       margin: 0 0 8px;
+
       color: #192b41;
+
       text-align: center;
+
       font-size: clamp(20px, 3vw, 24px);
+
     }
 
     .recovery-card .muted {
+
       color: #64748b;
+
       text-align: center;
+
       font-size: 14px;
+
       margin: 0 0 8px;
+
     }
 
     .recovery-card label {
+
       display: block;
+
       margin: 18px 0 6px;
+
       font-weight: 700;
+
       color: #24364e;
+
       font-size: 13px;
+
     }
 
     .recovery-card input {
+
       width: 100%;
+
       padding: 12px;
+
       border: 1px solid #d7e0ed;
+
       border-radius: 9px;
+
       box-sizing: border-box;
+
       font-size: 16px;
+
       color: #21334d;
+
       background: #fff;
+
     }
 
     .recovery-card input:focus {
+
       outline: 2px solid #1372ee;
+
       outline-offset: 1px;
+
       border-color: #1372ee;
+
     }
 
     .recovery-card .primary {
+
       width: 100%;
+
       margin-top: 20px;
+
       padding: 12px;
+
       background: #1372ee;
+
       color: #fff;
+
       border: 0;
+
       border-radius: 9px;
+
       font-weight: 700;
+
       cursor: pointer;
+
       font-size: 15px;
+
     }
 
     .recovery-card .primary:hover:not(:disabled) {
+
       background: #0b5dcf;
+
     }
 
     .recovery-card .primary:disabled {
+
       opacity: .6;
+
       cursor: default;
+
     }
 
     .recovery-card .secondary {
+
       width: 100%;
+
       margin-top: 10px;
+
       padding: 10px;
+
       border: 0;
+
       background: transparent;
+
       color: #1765cb;
+
       cursor: pointer;
+
       font-weight: 600;
+
       font-size: 14px;
+
     }
 
     .recovery-card .secondary:hover {
+
       background: #f0f5ff;
+
       border-radius: 6px;
+
     }
 
     .recovery-status {
+
       min-height: 20px;
+
       font-size: 13px;
+
       line-height: 1.5;
+
       margin: 12px 0 0;
+
     }
 
     .recovery-hint {
+
       font-size: 12px;
+
       color: #73839a;
+
       margin-top: 14px;
+
       text-align: center;
+
     }
+
   </style>
+
 </head>
 
 <body>
 
   <!-- Aquí se muestra toda la aplicación -->
+
   <div id="app"></div>
 
   <!-- Supabase: autenticación, canciones y servicios -->
+
   <script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2/dist/umd/supabase.min.js"></script>
 
   <!-- Configuración de Supabase -->
+
   <script src="config.js"></script>
 
   <!-- PDF.js -->
+
   <script src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js"></script>
 
   <!-- Mammoth: visualización de Word DOCX -->
+
   <script src="https://cdn.jsdelivr.net/npm/mammoth@1.6.0/mammoth.browser.min.js"></script>
 
   <script>
+
     // Configuración del lector PDF
+
     if (typeof pdfjsLib !== 'undefined') {
+
       pdfjsLib.GlobalWorkerOptions.workerSrc =
+
         'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js';
+
     }
+
   </script>
 
   <!-- Aplicación principal -->
+
   <script src="app.js"></script>
 
   <!-- Recuperación de contraseña -->
+
   <script>
+
     (() => {
+
       const authClient =
+
         typeof supa !== 'undefined' ? supa : null;
 
       function detectRecovery() {
+
         const hashParams = new URLSearchParams(location.hash.slice(1));
+
         const queryParams = new URLSearchParams(location.search);
 
         return hashParams.get('type') === 'recovery' ||
+
                queryParams.get('type') === 'recovery';
+
       }
 
       let showChangePassword = detectRecovery();
 
-      function safeText(element, message, ok = false) {
-        element.textContent = message;
-        element.style.color = ok ? '#167044' : '#b42332';
+      // Detecta si venimos de un enlace de recuperación
+
+      function detectRecovery() {
+
+        const hashParams = new URLSearchParams(location.hash.slice(1));
+
+        const queryParams = new URLSearchParams(location.search);
+
+        return hashParams.get('type') === 'recovery' || queryParams.get('type') === 'recovery';
+
       }
 
-      function removeRecovery() {
+              function safeText(el, message, ok = false) {
+          el.textContent = message;
+          el.style.color = ok ? '#167044' : '#b42332';
+        }
+
+function removeRecovery() {
+
         document.getElementById('recovery-overlay')?.remove();
+
       }
 
       function recoveryModal(mode) {
+
         removeRecovery();
 
         const shade = document.createElement('div');
+
         shade.id = 'recovery-overlay';
+
         shade.className = 'recovery-shade';
 
         const card = document.createElement('section');
+
         card.className = 'recovery-card';
+
         card.setAttribute('role', 'dialog');
+
         card.setAttribute('aria-modal', 'true');
+
         card.setAttribute(
+
           'aria-label',
+
           mode === 'change' ? 'Cambiar contraseña' : 'Recuperar contraseña'
+
         );
 
         const heading = document.createElement('h2');
+
         heading.textContent =
+
           mode === 'change' ? 'Crear nueva contraseña' : 'Recuperar contraseña';
 
         const info = document.createElement('p');
+
         info.className = 'muted';
+
         info.textContent = mode === 'change'
+
           ? 'Escribe una contraseña nueva para tu cuenta.'
+
           : 'Te enviaremos un enlace a tu correo registrado en Supabase.';
 
         const form = document.createElement('form');
 
         const label = document.createElement('label');
+
         label.textContent =
+
           mode === 'change' ? 'Nueva contraseña' : 'Correo electrónico';
 
         const input = document.createElement('input');
+
         input.type = mode === 'change' ? 'password' : 'email';
+
         input.required = true;
+
         input.autocomplete =
+
           mode === 'change' ? 'new-password' : 'email';
 
         input.placeholder = mode === 'change'
+
           ? 'Mínimo 8 caracteres'
+
           : 'correo@gmail.com';
 
         if (mode === 'change') {
+
           input.minLength = 8;
+
         }
 
         if (mode === 'request') {
+
           input.value =
+
             document.getElementById('login-email')?.value?.trim() || '';
+
         }
 
         const button = document.createElement('button');
+
         button.type = 'submit';
+
         button.className = 'primary';
+
         button.textContent =
+
           mode === 'change' ? 'Guardar contraseña' : 'Enviar enlace';
 
         const status = document.createElement('p');
+
         status.className = 'recovery-status';
+
         status.setAttribute('role', 'status');
+
         status.setAttribute('aria-live', 'polite');
 
         const back = document.createElement('button');
+
         back.type = 'button';
+
         back.className = 'secondary';
+
         back.textContent = 'Volver';
 
         back.addEventListener('click', () => {
+
           if (mode === 'change') {
+
             if (!confirm('¿Salir sin cambiar la contraseña?')) return;
+
           }
+
           removeRecovery();
+
         });
 
         const hint = document.createElement('p');
+
         hint.className = 'recovery-hint';
+
         hint.textContent = mode === 'change'
+
           ? 'Al guardar, tu contraseña anterior dejará de funcionar.'
+
           : 'Revisa también la carpeta de Spam o Correo no deseado.';
 
         form.append(label, input, button, status);
+
         card.append(heading, info, form, back, hint);
+
         shade.append(card);
+
         document.body.append(shade);
 
         input.focus();
 
-        form.addEventListener('submit', async event => {
+        form.addEventListener('submit', async (event) => {
+
           event.preventDefault();
 
           if (!authClient) {
+
             safeText(
+
               status,
+
               'No se pudo cargar Supabase. Revisa tu conexión a internet.'
+
             );
+
             return;
+
           }
 
           button.disabled = true;
+
           const originalText = button.textContent;
+
           button.textContent = 'Procesando...';
 
           try {
+
             if (mode === 'request') {
+
               const redirectTo = location.origin + location.pathname;
 
               const { error } = await authClient.auth.resetPasswordForEmail(
+
                 input.value.trim(),
+
                 { redirectTo }
+
               );
 
               if (error) throw error;
 
               safeText(
+
                 status,
+
                 'Si la cuenta existe, recibirás un correo con el enlace de recuperación. Revisa también Spam.',
+
                 true
+
               );
 
             } else {
+
               const { error } = await authClient.auth.updateUser({
+
                 password: input.value
+
               });
 
               if (error) throw error;
 
               history.replaceState(null, '', location.pathname);
+
               showChangePassword = false;
 
               safeText(
+
                 status,
+
                 'Contraseña actualizada correctamente. Ya puedes utilizar tu cuenta.',
+
                 true
+
               );
 
               button.remove();
+
               back.textContent = 'Continuar';
+
               back.onclick = () => removeRecovery();
+
             }
 
           } catch (error) {
+
             safeText(
+
               status,
+
               'No se pudo completar: ' +
+
                 (error?.message || 'Intenta nuevamente.')
+
             );
+
           } finally {
+
             button.disabled = false;
 
             if (button.isConnected) {
+
               button.textContent = originalText;
+
             }
+
           }
+
         });
+
       }
 
       // Insertar el enlace de recuperación en el login
+
       function insertForgotLink() {
+
         const form = document.getElementById('login-form');
 
         if (!form) return;
+
         if (form.querySelector('#forgot-password')) return;
 
         const forgot = document.createElement('button');
+
         forgot.id = 'forgot-password';
+
         forgot.type = 'button';
+
         forgot.className = 'recover-link';
+
         forgot.textContent = '¿Olvidaste tu contraseña?';
 
         forgot.addEventListener('click', () => {
+
           recoveryModal('request');
+
         });
 
         form.append(forgot);
+
       }
 
       const root = document.getElementById('app');
 
       const observer = new MutationObserver(insertForgotLink);
+
       observer.observe(root, {
+
         childList: true,
+
         subtree: true
+
       });
 
       insertForgotLink();
 
       // Detectar el enlace de recuperación enviado al correo
+
       if (authClient) {
+
         authClient.auth.onAuthStateChange(event => {
+
           if (event === 'PASSWORD_RECOVERY') {
+
             showChangePassword = true;
+
             recoveryModal('change');
+
           }
+
         });
+
       }
 
       if (showChangePassword) {
+
         recoveryModal('change');
+
       }
+
     })();
+
   </script>
 
   <!-- Registrar Service Worker -->
+
   <script>
+
     if ('serviceWorker' in navigator) {
+
       window.addEventListener('load', async () => {
+
         try {
+
           const registration =
+
             await navigator.serviceWorker.register('./sw.js');
 
           console.log('Service Worker registrado:', registration.scope);
+
         } catch (error) {
+
           console.warn('No se pudo registrar Service Worker:', error);
+
         }
+
       });
+
     }
+
   </script>
 
 </body>
+
 </html>
