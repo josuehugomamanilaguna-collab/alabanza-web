@@ -110,7 +110,7 @@ function asSong(row) {
     contenidoTexto: row.contenido_texto || '',
     links: {
       youtube: row.youtube_url || '',
-      spotify: row.spotify_url || '',
+      lacuerda: row.lacuerda_url || '',
       facebook: row.facebook_url || ''
     },
     files: {
@@ -135,7 +135,7 @@ function asSongRow(s) {
     acordes_pdf_url: s.files?.chords?.path || null,
     acordes_imagen_url: s.files?.image?.path || null,
     youtube_url: s.links?.youtube || null,
-    spotify_url: s.links?.spotify || null,
+    lacuerda_url: s.links?.lacuerda || null,
     facebook_url: s.links?.facebook || null,
     creado_por: currentUser.id
   };
@@ -793,7 +793,7 @@ function fileButtons(s) {
   if (s.files?.chords) btns.push(`<button class="btn secondary small" data-action="view-file" data-id="${s.files.chords.id}" data-type="pdf">🎼 Acordes</button>`);
   if (s.files?.image) btns.push(`<button class="btn secondary small" data-action="view-file" data-id="${s.files.image.id}" data-type="image">🖼 Imagen</button>`);
   if (safeUrl(s.links?.youtube)) btns.push(`<a class="btn secondary small" target="_blank" rel="noopener noreferrer" href="${safeUrl(s.links.youtube)}">▶ YouTube</a>`);
-  if (safeUrl(s.links?.spotify)) btns.push(`<a class="btn secondary small" target="_blank" rel="noopener noreferrer" href="${safeUrl(s.links.spotify)}">♫ Spotify</a>`);
+  if (safeUrl(s.links?.lacuerda)) btns.push(`<a class="btn secondary small" target="_blank" rel="noopener noreferrer" href="${safeUrl(s.links.lacuerda)}">♫ LaCuerda</a>`);
   if (safeUrl(s.links?.facebook)) btns.push(`<a class="btn secondary small" target="_blank" rel="noopener noreferrer" href="${safeUrl(s.links.facebook)}">f Facebook</a>`);
   return `<div class="file-list">${btns.join('')}</div>`;
 }
@@ -1050,7 +1050,7 @@ function newSongModal(song) {
             <input type="file" name="${k}" accept="${k === 'pdf' || k === 'chords' ? '.pdf,application/pdf' : k === 'word' ? '.doc,.docx,application/msword,application/vnd.openxmlformats-officedocument.wordprocessingml.document' : 'image/*'}"/>
             ${s.files?.[k] ? `<p class="hint">Actual: ${escapeHtml(s.files[k].name)} — deja vacío para conservarlo.</p>` : ''}
           </div>`).join('')}
-        ${[['youtube', 'YouTube'], ['spotify', 'Spotify'], ['facebook', 'Facebook']]
+        ${[['youtube', 'YouTube'], ['lacuerda', 'lacuerda'], ['facebook', 'Facebook']]
           .map(([k, label]) => `<div class="field">
             <label>Enlace ${label} (opcional)</label>
             <input class="input" name="${k}" type="url" placeholder="https://..." value="${escapeHtml(s.links?.[k] || '')}"/>
@@ -1933,7 +1933,7 @@ document.addEventListener('submit', async e => {
     contenidoTexto: String(fd.get('manualLyrics') ?? current?.contenidoTexto ?? ''),
     links: {
       youtube: fd.get('youtube'),
-      spotify: fd.get('spotify'),
+      lacuerda: fd.get('lacuerda'),
       facebook: fd.get('facebook')
     },
     files: { ...(current?.files || {}) }
