@@ -4,6 +4,7 @@
 // 1) Artistas y Bandas expandibles con lista de canciones
 // 2) Visor embebido de letras (PDF/imagen/texto extraído)
 // 3) Modo offline con cache automático
+// + Descarga de letra manual en Word con formato de palomitas
 // ============================================================
 
 const supa = typeof supabase !== 'undefined' && typeof SUPABASE_URL !== 'undefined' && typeof SUPABASE_PUBLISHABLE_KEY !== 'undefined'
@@ -35,8 +36,8 @@ const op = new Promise((resolve, reject) => {
 
 // --- Estado ---
 let songs = [], services = [], artists = [], categories = [], serviceSections = [];
-let expandedArtists = new Set(); // artistas expandidos en la vista
-let offlineFiles = new Set(); // paths de archivos cacheados
+let expandedArtists = new Set();
+let offlineFiles = new Set();
 const uuid = () => crypto.randomUUID();
 
 const escapeHtml = s => String(s ?? '').replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
@@ -46,7 +47,6 @@ const normalize = s => String(s || '').normalize('NFD').replace(/[\u0300-\u036f]
 function tx(store, mode = 'readonly') { return db.transaction(store, mode).objectStore(store); }
 function req(request) { return new Promise((resolve, reject) => { request.onsuccess = () => resolve(request.result); request.onerror = () => reject(request.error); }); }
 
-// Los datos offline pertenecen a la cuenta que inició sesión en ESTE dispositivo.
 function offlineKey(path) { return `${currentUser?.id || 'sin-usuario'}:${path}`; }
 async function saveSnapshot() {
   if (!currentUser || offlineMode) return;
@@ -89,7 +89,6 @@ function requireInternet() {
   }
   return true;
 }
-
 
 // --- Detección de conexión ---
 window.addEventListener('online', () => { isOnline = true; if (currentUser) refresh(); else render(); toast('🟢 Conexión restaurada'); });
@@ -169,7 +168,6 @@ async function fetchCloud() {
       .map(i => ({ id: i.id, songId: i.cancion_id, section: i.seccion, tone: i.tonalidad || '' }))
   }));
 
-  // Detectar archivos en cache offline
   await detectOfflineFiles();
   await saveSnapshot();
 }
@@ -201,7 +199,6 @@ async function refresh() {
     cloudProblem = '';
   } catch (e) {
     console.error('Falló actualización de nube', e);
-    // Si Supabase está temporalmente inaccesible, conserva las últimas canciones.
     try {
       if (await loadSnapshot()) {
         offlineMode = true;
@@ -311,7 +308,7 @@ async function uploadSongFile(file) {
   return { id: path, path, name: file.name };
 }
 
-// --- Cache offline: guardar archivo ---
+// --- Cache offline ---
 async function cacheFile(path, blob) {
   if (!currentUser) return;
   await op;
@@ -319,7 +316,6 @@ async function cacheFile(path, blob) {
   offlineFiles.add(path);
 }
 
-// Primero utiliza el archivo privado guardado para esta cuenta en el dispositivo.
 async function getFileBlob(path) {
   if (!currentUser) throw Error('Inicia sesión antes de abrir documentos.');
   await op;
@@ -334,7 +330,7 @@ async function getFileBlob(path) {
   return blob;
 }
 
-// --- PASO 39: Encabezados y letras escritas manualmente ---
+// --- Letras manuales ---
 const LYRIC_HEADINGS = new Map([
   ['INTRO','intro'], ['INTRODUCCION','intro'],
   ['CORO','coro'], ['ESTRIBILLO','coro'],
@@ -352,13 +348,13 @@ function lyricLinesHtml(text) {
     return `<p class="lyric-line ${kind ? 'lyric-part lyric-' + kind : ''}">${escapeHtml(line) || '&nbsp;'}</p>`;
   }).join('');
 }
-// Colorea únicamente los párrafos que son títulos de sección completos.
 function markWordHeadings(container) {
   container.querySelectorAll('p').forEach(p => {
     const kind = lyricHeadingClass(p.textContent);
     if (kind && !p.querySelector('img')) p.classList.add('lyric-part', 'lyric-' + kind);
   });
 }
+
 function manualLyricsViewer(song) {
   const s = songs.find(x => x.id === song);
   if (!s?.contenidoTexto?.trim()) { toast('Esta canción todavía no tiene una letra escrita.'); return; }
@@ -369,6 +365,7 @@ function manualLyricsViewer(song) {
       <button class="btn secondary small" id="manual-more">A+</button>
       <button class="btn secondary small" id="manual-dark">🌙 Modo oscuro</button>
       <button class="btn secondary small" id="manual-full">⛶ Pantalla completa</button>
+      <button class="btn secondary small" id="manual-download-word">⬇️ Word</button>
     </div>
     <div class="manual-lyric-page" id="manual-lyric-page">
       <div class="lyric-doves"><span aria-hidden="true">🕊️</span><span aria-hidden="true">🕊️</span></div>
@@ -385,8 +382,102 @@ function manualLyricsViewer(song) {
     try { if (!document.fullscreenElement) await page.requestFullscreen(); else await document.exitFullscreen(); }
     catch (e) { toast('Pantalla completa no disponible en este dispositivo.'); }
   };
+  overlay.querySelector('#manual-download-word').onclick = () =>
+    downloadLyricsAsWordFromData(s.name, s.contenidoTexto);
   update();
 }
+
+// Genera y descarga un .doc con formato de palomitas
+function downloadLyricsAsWordFromData(title, text) {
+  title = (title || 'CANCIÓN').trim() || 'CANCIÓN';
+  text = text || '';
+
+  if (!text.trim()) {
+    toast('No hay letra para descargar.');
+    return;
+  }
+
+  const headingFor = (line) => {
+    const key = normalize(line)
+      .replace(/\s*[:：.\-–]\s*$/, '')
+      .replace(/\s+/g, ' ')
+      .toUpperCase();
+    return LYRIC_HEADINGS.get(key) || '';
+  };
+
+  const colorFor = (kind) => {
+    if (kind === 'coro') return '#b91c1c';
+    if (kind === 'intro' || kind === 'instrumental' || kind === 'verso' ||
+        kind === 'puente' || kind === 'final') return '#173b77';
+    return '#1f2937';
+  };
+
+  const lines = String(text).replace(/\r\n?/g, '\n').split('\n');
+
+  const bodyHtml = lines.map(line => {
+    const kind = headingFor(line);
+    if (kind) {
+      return `<p style="margin:22px 0 8px;text-align:center;font-weight:bold;font-size:13pt;letter-spacing:0.5pt;color:${colorFor(kind)};">${escapeHtml(line)}</p>`;
+    }
+    return `<p style="margin:0 0 6px;text-align:center;font-size:12pt;line-height:1.6;">${escapeHtml(line) || '&nbsp;'}</p>`;
+  }).join('');
+
+  const html = `
+    <html xmlns:o="urn:schemas-microsoft-com:office:office"
+          xmlns:w="urn:schemas-microsoft-com:office:word"
+          xmlns="http://www.w3.org/TR/REC-html40">
+    <head>
+      <meta charset="utf-8">
+      <title>${escapeHtml(title)}</title>
+      <!--[if gte mso 9]>
+      <xml><w:WordDocument><w:View>Print</w:View><w:Zoom>100</w:Zoom></w:WordDocument></xml>
+      <![endif]-->
+      <style>
+        @page { size: A4; margin: 2cm; }
+        body { font-family: Arial, Helvetica, sans-serif; color: #1f2937; }
+        .doves { width: 100%; margin-bottom: 8px; }
+        .doves td { font-size: 26pt; }
+        .title { text-align: center; font-size: 18pt; font-weight: bold;
+                 color: #355fa1; text-transform: uppercase; margin: 4px 0 26px; }
+      </style>
+    </head>
+    <body>
+      <table class="doves" width="100%">
+        <tr>
+          <td align="left" style="font-size:26pt;">&#128330;</td>
+          <td align="right" style="font-size:26pt;">&#128330;</td>
+        </tr>
+      </table>
+      <p class="title">${escapeHtml(title)}</p>
+      ${bodyHtml}
+    </body>
+    </html>
+  `;
+
+  const blob = new Blob(['\ufeff', html], { type: 'application/msword' });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = title.replace(/[^\w\s\-áéíóúÁÉÍÓÚñÑ]/g, '').trim() + '.doc';
+  document.body.append(a);
+  a.click();
+  a.remove();
+  setTimeout(() => URL.revokeObjectURL(url), 1500);
+
+  toast('Letra descargada en Word 🕊️');
+}
+
+// Versión para el formulario
+function downloadLyricsAsWord() {
+  const field = document.getElementById('song-manual-text');
+  const titleInput = document.querySelector('#song-form [name="name"]');
+  if (!field) {
+    toast('Abre primero el formulario de la canción.');
+    return;
+  }
+  downloadLyricsAsWordFromData(titleInput?.value || 'CANCIÓN', field.value || '');
+}
+
 function updateLyricsPreview() {
   const field = document.getElementById('song-manual-text');
   const title = document.querySelector('#song-form [name="name"]');
@@ -397,10 +488,7 @@ function updateLyricsPreview() {
     <div class="lyric-body">${lyricLinesHtml(field.value)}</div>`;
 }
 
-// --- UI helpers ---
-
- // --- PASO 27: Biblioteca completa sin internet ---
-
+// --- Biblioteca offline ---
 let offlineDownloadRunning = false;
 let offlineDownloadCancel = false;
 
@@ -417,12 +505,7 @@ function libraryFilePaths() {
 function offlineProgressSummary() {
   const paths = libraryFilePaths();
   const saved = paths.filter(path => offlineFiles.has(path)).length;
-
-  return {
-    total: paths.length,
-    saved,
-    pending: paths.length - saved
-  };
+  return { total: paths.length, saved, pending: paths.length - saved };
 }
 
 async function prepareOfflineLibrary() {
@@ -454,79 +537,26 @@ async function prepareOfflineLibrary() {
   dialog.id = 'offline-download-dialog';
 
   dialog.innerHTML = `
-    <section class="modal"
-      role="dialog"
-      aria-modal="true"
-      aria-label="Guardar biblioteca sin internet"
-      style="width:min(540px,100%)">
-
-      <h2 style="margin-top:0">
-        ⬇ Preparar biblioteca sin internet
-      </h2>
-
-      <p class="muted">
-        Descargando documentos al almacenamiento
-        de este dispositivo. Mantén esta página
-        abierta y el WiFi conectado.
-      </p>
-
-      <p id="offline-download-status"
-        role="status"
-        aria-live="polite">
-        Preparando descarga…
-      </p>
-
-      <progress
-        id="offline-download-progress"
-        max="${missing.length}"
-        value="0"
-        style="width:100%;height:17px">
-      </progress>
-
-      <p class="muted compact"
-        id="offline-download-details">
-      </p>
-
-      <div class="row between"
-        style="margin-top:18px">
-
-        <button type="button"
-          class="btn secondary"
-          id="offline-download-cancel">
-          Detener
-        </button>
-
-        <button type="button"
-          class="btn green"
-          id="offline-download-done"
-          disabled>
-          Cerrar
-        </button>
+    <section class="modal" role="dialog" aria-modal="true" aria-label="Guardar biblioteca sin internet" style="width:min(540px,100%)">
+      <h2 style="margin-top:0">⬇ Preparar biblioteca sin internet</h2>
+      <p class="muted">Descargando documentos al almacenamiento de este dispositivo. Mantén esta página abierta y el WiFi conectado.</p>
+      <p id="offline-download-status" role="status" aria-live="polite">Preparando descarga…</p>
+      <progress id="offline-download-progress" max="${missing.length}" value="0" style="width:100%;height:17px"></progress>
+      <p class="muted compact" id="offline-download-details"></p>
+      <div class="row between" style="margin-top:18px">
+        <button type="button" class="btn secondary" id="offline-download-cancel">Detener</button>
+        <button type="button" class="btn green" id="offline-download-done" disabled>Cerrar</button>
       </div>
     </section>
   `;
 
   document.body.append(dialog);
 
-  const status = dialog.querySelector(
-    '#offline-download-status'
-  );
-
-  const details = dialog.querySelector(
-    '#offline-download-details'
-  );
-
-  const progress = dialog.querySelector(
-    '#offline-download-progress'
-  );
-
-  const cancel = dialog.querySelector(
-    '#offline-download-cancel'
-  );
-
-  const done = dialog.querySelector(
-    '#offline-download-done'
-  );
+  const status = dialog.querySelector('#offline-download-status');
+  const details = dialog.querySelector('#offline-download-details');
+  const progress = dialog.querySelector('#offline-download-progress');
+  const cancel = dialog.querySelector('#offline-download-cancel');
+  const done = dialog.querySelector('#offline-download-done');
 
   cancel.addEventListener('click', () => {
     offlineDownloadCancel = true;
@@ -534,52 +564,28 @@ async function prepareOfflineLibrary() {
     cancel.textContent = 'Deteniendo…';
   });
 
-  done.addEventListener('click', () => {
-    dialog.remove();
-  });
+  done.addEventListener('click', () => { dialog.remove(); });
 
-  let saved = 0;
-  let failures = 0;
-  let attempted = 0;
+  let saved = 0, failures = 0, attempted = 0;
 
   for (const path of missing) {
     if (offlineDownloadCancel) break;
-
     if (!navigator.onLine) {
-      status.textContent =
-        'Se perdió la conexión. Descarga detenida.';
+      status.textContent = 'Se perdió la conexión. Descarga detenida.';
       break;
     }
-
-    const filename = decodeURIComponent(
-      path.split('/').pop() || path
-    );
-
-    status.textContent =
-      `Guardando ${attempted + 1} de ${missing.length}: ${filename}`;
-
+    const filename = decodeURIComponent(path.split('/').pop() || path);
+    status.textContent = `Guardando ${attempted + 1} de ${missing.length}: ${filename}`;
     try {
-      // Obtiene el archivo y lo guarda en IndexedDB.
       await getFileBlob(path);
       saved++;
-
     } catch (error) {
       failures++;
-
-      console.warn(
-        'Error preparando documento offline:',
-        filename,
-        error
-      );
+      console.warn('Error preparando documento offline:', filename, error);
     }
-
     attempted++;
     progress.value = attempted;
-
-    details.textContent =
-      `${saved} guardados · ` +
-      `${failures} errores · ` +
-      `${missing.length - attempted} restantes`;
+    details.textContent = `${saved} guardados · ${failures} errores · ${missing.length - attempted} restantes`;
   }
 
   offlineDownloadRunning = false;
@@ -589,16 +595,12 @@ async function prepareOfflineLibrary() {
   await detectOfflineFiles();
 
   const summary = offlineProgressSummary();
-
   status.textContent = offlineDownloadCancel
     ? 'Descarga detenida. Puedes continuar después.'
     : summary.pending === 0
       ? '¡Biblioteca preparada! Todos los documentos están disponibles.'
       : `Proceso terminado. Quedan ${summary.pending} documentos pendientes.`;
-
-  details.textContent =
-    `${summary.saved} de ${summary.total} documentos guardados · ` +
-    `${failures} errores en esta descarga`;
+  details.textContent = `${summary.saved} de ${summary.total} documentos guardados · ${failures} errores en esta descarga`;
 
   render();
 }
@@ -697,20 +699,14 @@ function inicio() {
       <div class="row">
         <button class="btn" data-action="new-song">+ Agregar canción</button>
         <button class="btn green" data-action="bulk-import">⇧ Importar varios PDF / Word</button>
-        
-        <button class="btn secondary" data-action="prepare-offline">
-          ⬇ Guardar biblioteca sin internet
-        </button>
-
+        <button class="btn secondary" data-action="prepare-offline">⬇ Guardar biblioteca sin internet</button>
       </div>
     </div>
-    
     <p class="muted compact" style="margin:14px 0 0">
       📦 Documentos preparados en este dispositivo:
       ${offlineProgressSummary().saved} de ${offlineProgressSummary().total}.
       Puedes reanudar la descarga cuando tengas internet.
     </p>
-
     <div class="cards">
       ${catCards}
       <button class="card" data-nav="biblioteca"><div class="symbol">📂</div><h3>Biblioteca completa</h3><h2>${songs.length}</h2><p>PDF, Word e imágenes →</p></button>
@@ -798,7 +794,7 @@ function fileButtons(s) {
   return `<div class="file-list">${btns.join('')}</div>`;
 }
 
-// --- ARTISTAS Y BANDAS (con expandible) ---
+// --- Artistas ---
 function artistas() {
   const filtered = artists
     .filter(a => a.nombre.toLowerCase().includes(search.toLowerCase()))
@@ -868,7 +864,7 @@ function renderArtistCard(a) {
   `;
 }
 
-// --- SERVICIOS ---
+// --- Servicios ---
 function servicios() {
   shell(header('Servicios', 'Prepara tu repertorio para cada culto o evento.') + `
     <div class="row between" style="margin-bottom:18px">
@@ -1043,6 +1039,11 @@ function newSongModal(song) {
           <details class="manual-preview-wrap"><summary>👁 Vista previa con las dos palomitas</summary>
             <div id="song-manual-preview" class="manual-lyric-page"></div>
           </details>
+          <div class="row" style="margin-top:12px">
+            <button type="button" class="btn secondary" data-action="download-lyrics-word">
+              ⬇️ Descargar letra en Word (🕊️🕊️)
+            </button>
+          </div>
         </div>
         ${[['pdf', 'Letra PDF'], ['word', 'Letra Word'], ['chords', 'Canción con acordes (PDF) — opcional'], ['image', 'Imagen con acordes — opcional']]
           .map(([k, label]) => `<div class="field upload">
@@ -1143,7 +1144,6 @@ async function importBulk(form) {
       fileId = uploaded.path;
       song.files[key] = uploaded;
 
-      // Extraer texto para offline
       const texto = await extractText(f);
       if (texto) song.contenidoTexto = texto;
 
@@ -1202,343 +1202,235 @@ async function viewFile(path, type) {
   const fileName = song ? Object.values(song.files).find(f => f?.path === path)?.name : path;
   const title = song ? `${song.name} — ${fileName || ''}` : fileName;
 
-  // Si es imagen → mostrar embebida
   if (type === 'image') {
     await showImageViewer(title, path);
     return;
   }
 
-  // Para PDF: intentar embed
   if (type === 'pdf') {
     await showPdfViewer(title, path);
     return;
   }
 
-  
-    // Mostrar Word DOCX dentro de la aplicación    
-    if (type === 'word') {
-      try {
-        const blob = await getFileBlob(path);
-        const arrayBuffer = await blob.arrayBuffer();
+  if (type === 'word') {
+    try {
+      const blob = await getFileBlob(path);
+      const arrayBuffer = await blob.arrayBuffer();
 
-        const resultado = await mammoth.convertToHtml({
-          arrayBuffer
-        });
+      const resultado = await mammoth.convertToHtml({ arrayBuffer });
+      const htmlOriginal = resultado.value;
 
-        const htmlOriginal = resultado.value;
-
-        if (!htmlOriginal.trim()) {
-          toast('El documento no contiene texto visible.');
-          return;
-        }
-
-        function prepararHtmlWord(html, nombreArchivo) {
-          const parser = new DOMParser();
-          const doc = parser.parseFromString(`<div id="wrap">${html}</div>`, 'text/html');
-          const wrap = doc.getElementById('wrap');
-
-          // Eliminar párrafos totalmente vacíos
-          wrap.querySelectorAll('p').forEach(p => {
-            if (!p.textContent.trim() && !p.querySelector('img')) {
-              p.remove();
-            }
-          });
-
-          const children = [...wrap.children];
-
-          // Buscar imágenes al inicio
-          const primerBloque = children[0];
-          let headerImages = [];
-          let possibleTitle = '';
-
-          if (primerBloque) {
-            headerImages = [...primerBloque.querySelectorAll('img')];
-
-            // Si ese mismo bloque tiene texto, lo tomamos como posible título
-            const text = primerBloque.textContent.trim();
-            if (text) possibleTitle = text;
-          }
-
-          // Buscar un título más limpio en los primeros elementos
-          let detectedTitle = '';
-          for (const el of children.slice(0, 4)) {
-            const txt = el.textContent.trim();
-            if (!txt) continue;
-
-            // Preferimos un texto corto como título
-            if (txt.length <= 40) {
-              detectedTitle = txt;
-              break;
-            }
-          }
-
-          const tituloFinal = detectedTitle || possibleTitle || nombreArchivo.replace(/\.[^/.]+$/, '');
-
-          // Crear nuevo contenedor ordenado
-          const nuevo = doc.createElement('div');
-          nuevo.className = 'word-clean';
-
-          // Encabezado con imágenes
-          if (headerImages.length) {
-            const header = doc.createElement('div');
-            header.className = 'word-header-images';
-
-            headerImages.slice(0, 2).forEach(img => {
-              const clon = img.cloneNode(true);
-              header.appendChild(clon);
-            });
-
-            nuevo.appendChild(header);
-          }
-
-          // Título
-          const h1 = doc.createElement('h1');
-          h1.textContent = tituloFinal.toUpperCase();
-          h1.className = 'word-main-title';
-          nuevo.appendChild(h1);
-
-          // Recorrer contenido y reconstruirlo
-          children.forEach((el, index) => {
-            // Saltar el primer bloque si era solo imágenes/título mezclado
-            if (index === 0) return;
-
-            const texto = el.textContent.trim();
-            const tieneImagen = el.querySelector('img');
-
-            if (tieneImagen) {
-              // Ignorar imágenes sueltas posteriores por ahora
-              return;
-            }
-
-            if (!texto) return;
-
-            // Saltar si el texto es el mismo título
-            if (texto.toUpperCase() === tituloFinal.toUpperCase()) return;
-
-            const p = doc.createElement('p');
-            p.innerHTML = el.innerHTML;
-            nuevo.appendChild(p);
-          });
-
-          markWordHeadings(nuevo);
-          return nuevo.innerHTML;
-        }
-
-        const html = prepararHtmlWord(htmlOriginal, title);
-
-        let modo = 'original';
-        let tamano = 18;
-        let oscuro = false;
-
-        modal(title, `
-          <div class="row between" style="margin-bottom:15px;gap:8px">
-            <div class="row">
-              <button class="btn secondary small" id="vista-original">
-                Vista original
-              </button>
-              <button class="btn secondary small" id="vista-lectura">
-                Vista lectura
-              </button>
-            </div>
-
-            <div class="row">
-              <button class="btn secondary small" id="letra-menos">A−</button>
-              <button class="btn secondary small" id="letra-mas">A+</button>
-              <button class="btn secondary small" id="modo-oscuro">🌙</button>
-              <button class="btn secondary small" id="pantalla-completa">⛶</button>
-            </div>
-          </div>
-
-          <iframe
-            id="word-viewer"
-            sandbox=""
-            title="Visor de canciones"
-            style="width:100%;height:68dvh;border:1px solid #dfe6ef;border-radius:12px;background:white">
-          </iframe>
-
-          <div class="row between" style="margin-top:15px">
-            <button class="btn secondary"
-              data-action="download-file"
-              data-id="${escapeHtml(path)}">
-              ⬇ Descargar original
-            </button>
-
-            <button class="btn secondary" data-action="close-modal">
-              Cerrar
-            </button>
-          </div>
-        `, { wide: true });
-
-        const overlay = document.getElementById('overlay');
-        const iframe = overlay.querySelector('#word-viewer');
-
-        function actualizarVisor() {
-          const lectura = modo === 'lectura';
-
-          const css = `
-          * { box-sizing: border-box; }
-
-          html {
-            background: ${oscuro ? '#0f1728' : '#f5f6f8'};
-          }
-
-          body {
-            max-width: 900px;
-            margin: 0 auto;
-            padding: 28px 20px 60px;
-            background: ${oscuro ? '#0f1728' : '#f5f6f8'};
-            color: ${oscuro ? '#f8fafc' : '#111827'};
-            font-family: Arial, sans-serif;
-            font-size: ${tamano}px;
-            line-height: ${lectura ? '1.9' : '1.65'};
-            overflow-wrap: break-word;
-          }
-
-          .word-clean {
-            background: ${oscuro ? '#111c31' : '#ffffff'};
-            border-radius: 16px;
-            padding: 36px 26px 42px;
-            box-shadow: ${oscuro ? '0 0 0 rgba(0,0,0,0)' : '0 10px 30px rgba(0,0,0,0.07)'};
-            min-height: 100%;
-          }
-
-          .word-header-images {
-            display: flex;
-            justify-content: space-between;
-            align-items: center;
-            gap: 30px;
-            margin-bottom: 18px;
-          }
-
-          .word-header-images img {
-            width: min(170px, 28%);
-            max-width: 170px;
-            height: auto;
-            object-fit: contain;
-          }
-
-          .word-main-title {
-            text-align: center;
-            color: ${oscuro ? '#9ec5ff' : '#5a78b5'};
-            font-size: ${lectura ? '2.0em' : '1.8em'};
-            margin: 8px 0 28px;
-            font-weight: 700;
-            letter-spacing: 0.5px;
-          }
-
-          p {
-            margin: 0 0 ${lectura ? '16px' : '10px'};
-            text-align: center;
-            font-size: ${lectura ? '1.08em' : '1em'};
-          }
-
-          h1, h2, h3 {
-            text-align: center;
-            color: ${oscuro ? '#9ec5ff' : '#4165a0'};
-            margin: 0 0 20px;
-          }
-
-          img {
-            max-width: 100%;
-            height: auto;
-          }
-
-          table {
-            max-width: 100%;
-            margin: auto;
-          }
-
-          td, th {
-            padding: 4px;
-            vertical-align: top;
-          }
-
-          a {
-            color: ${oscuro ? '#a9c7ff' : '#1765cb'};
-          }
-
-          .word-clean p:empty { display:none; }
-          .lyric-part {font-weight:800 !important; letter-spacing:.45px; margin-top:20px !important;}
-          .lyric-intro, .lyric-instrumental, .lyric-verso, .lyric-puente, .lyric-final {color:${oscuro ? '#93c5fd' : '#173b77'} !important;}
-          .lyric-coro {color:${oscuro ? '#fda4af' : '#b91c1c'} !important;}
-        `;
-          // El iframe aislado no ejecuta scripts del documento.
-          iframe.srcdoc = `
-            <!DOCTYPE html>
-            <html lang="es">
-            <head>
-              <meta charset="UTF-8">
-              <meta name="viewport" content="width=device-width, initial-scale=1">
-              <style>${css}</style>
-            </head>
-            <body>${html}</body>
-            </html>
-          `;
-
-          overlay.querySelector('#vista-original').style.background =
-            modo === 'original' ? '#1372ee' : '#eaf2ff';
-
-          overlay.querySelector('#vista-original').style.color =
-            modo === 'original' ? '#fff' : '#1763c1';
-
-          overlay.querySelector('#vista-lectura').style.background =
-            modo === 'lectura' ? '#1372ee' : '#eaf2ff';
-
-          overlay.querySelector('#vista-lectura').style.color =
-            modo === 'lectura' ? '#fff' : '#1763c1';
-        }
-
-        overlay.querySelector('#vista-original').addEventListener('click', () => {
-          modo = 'original';
-          actualizarVisor();
-        });
-
-        overlay.querySelector('#vista-lectura').addEventListener('click', () => {
-          modo = 'lectura';
-          actualizarVisor();
-        });
-
-        overlay.querySelector('#letra-mas').addEventListener('click', () => {
-          tamano = Math.min(tamano + 2, 36);
-          actualizarVisor();
-        });
-
-        overlay.querySelector('#letra-menos').addEventListener('click', () => {
-          tamano = Math.max(tamano - 2, 12);
-          actualizarVisor();
-        });
-
-        overlay.querySelector('#modo-oscuro').addEventListener('click', () => {
-          oscuro = !oscuro;
-          actualizarVisor();
-        });
-
-        overlay.querySelector('#pantalla-completa').addEventListener('click', async () => {
-          const ventana = overlay.querySelector('.modal');
-
-          if (!document.fullscreenElement) {
-            await ventana.requestFullscreen();
-            ventana.style.width = '100%';
-            ventana.style.maxHeight = '100dvh';
-            iframe.style.height = 'calc(100dvh - 200px)';
-          } else {
-            await document.exitFullscreen();
-            iframe.style.height = '68dvh';
-          }
-        });
-
-        actualizarVisor();
-
-      } catch (error) {
-        console.error(error);
-        toast('Error al visualizar Word: ' + error.message);
+      if (!htmlOriginal.trim()) {
+        toast('El documento no contiene texto visible.');
+        return;
       }
 
-      return;
+      function prepararHtmlWord(html, nombreArchivo) {
+        const parser = new DOMParser();
+        const doc = parser.parseFromString(`<div id="wrap">${html}</div>`, 'text/html');
+        const wrap = doc.getElementById('wrap');
+
+        wrap.querySelectorAll('p').forEach(p => {
+          if (!p.textContent.trim() && !p.querySelector('img')) {
+            p.remove();
+          }
+        });
+
+        const children = [...wrap.children];
+
+        const primerBloque = children[0];
+        let headerImages = [];
+        let possibleTitle = '';
+
+        if (primerBloque) {
+          headerImages = [...primerBloque.querySelectorAll('img')];
+          const text = primerBloque.textContent.trim();
+          if (text) possibleTitle = text;
+        }
+
+        let detectedTitle = '';
+        for (const el of children.slice(0, 4)) {
+          const txt = el.textContent.trim();
+          if (!txt) continue;
+          if (txt.length <= 40) {
+            detectedTitle = txt;
+            break;
+          }
+        }
+
+        const tituloFinal = detectedTitle || possibleTitle || nombreArchivo.replace(/\.[^/.]+$/, '');
+
+        const nuevo = doc.createElement('div');
+        nuevo.className = 'word-clean';
+
+        if (headerImages.length) {
+          const header = doc.createElement('div');
+          header.className = 'word-header-images';
+          headerImages.slice(0, 2).forEach(img => {
+            const clon = img.cloneNode(true);
+            header.appendChild(clon);
+          });
+          nuevo.appendChild(header);
+        }
+
+        const h1 = doc.createElement('h1');
+        h1.textContent = tituloFinal.toUpperCase();
+        h1.className = 'word-main-title';
+        nuevo.appendChild(h1);
+
+        children.forEach((el, index) => {
+          if (index === 0) return;
+          const texto = el.textContent.trim();
+          const tieneImagen = el.querySelector('img');
+          if (tieneImagen) return;
+          if (!texto) return;
+          if (texto.toUpperCase() === tituloFinal.toUpperCase()) return;
+          const p = doc.createElement('p');
+          p.innerHTML = el.innerHTML;
+          nuevo.appendChild(p);
+        });
+
+        markWordHeadings(nuevo);
+        return nuevo.innerHTML;
+      }
+
+      const html = prepararHtmlWord(htmlOriginal, title);
+
+      let modo = 'original';
+      let tamano = 18;
+      let oscuro = false;
+
+      modal(title, `
+        <div class="row between" style="margin-bottom:15px;gap:8px">
+          <div class="row">
+            <button class="btn secondary small" id="vista-original">Vista original</button>
+            <button class="btn secondary small" id="vista-lectura">Vista lectura</button>
+          </div>
+          <div class="row">
+            <button class="btn secondary small" id="letra-menos">A−</button>
+            <button class="btn secondary small" id="letra-mas">A+</button>
+            <button class="btn secondary small" id="modo-oscuro">🌙</button>
+            <button class="btn secondary small" id="pantalla-completa">⛶</button>
+          </div>
+        </div>
+        <iframe id="word-viewer" sandbox="" title="Visor de canciones" style="width:100%;height:68dvh;border:1px solid #dfe6ef;border-radius:12px;background:white"></iframe>
+        <div class="row between" style="margin-top:15px">
+          <button class="btn secondary" data-action="download-file" data-id="${escapeHtml(path)}">⬇ Descargar original</button>
+          <button class="btn secondary" data-action="close-modal">Cerrar</button>
+        </div>
+      `, { wide: true });
+
+      const overlay = document.getElementById('overlay');
+      const iframe = overlay.querySelector('#word-viewer');
+
+      function actualizarVisor() {
+        const lectura = modo === 'lectura';
+
+        const css = `
+        * { box-sizing: border-box; }
+        html { background: ${oscuro ? '#0f1728' : '#f5f6f8'}; }
+        body {
+          max-width: 900px;
+          margin: 0 auto;
+          padding: 28px 20px 60px;
+          background: ${oscuro ? '#0f1728' : '#f5f6f8'};
+          color: ${oscuro ? '#f8fafc' : '#111827'};
+          font-family: Arial, sans-serif;
+          font-size: ${tamano}px;
+          line-height: ${lectura ? '1.9' : '1.65'};
+          overflow-wrap: break-word;
+        }
+        .word-clean {
+          background: ${oscuro ? '#111c31' : '#ffffff'};
+          border-radius: 16px;
+          padding: 36px 26px 42px;
+          box-shadow: ${oscuro ? '0 0 0 rgba(0,0,0,0)' : '0 10px 30px rgba(0,0,0,0.07)'};
+          min-height: 100%;
+        }
+        .word-header-images {
+          display: flex;
+          justify-content: space-between;
+          align-items: center;
+          gap: 30px;
+          margin-bottom: 18px;
+        }
+        .word-header-images img {
+          width: min(170px, 28%);
+          max-width: 170px;
+          height: auto;
+          object-fit: contain;
+        }
+        .word-main-title {
+          text-align: center;
+          color: ${oscuro ? '#9ec5ff' : '#5a78b5'};
+          font-size: ${lectura ? '2.0em' : '1.8em'};
+          margin: 8px 0 28px;
+          font-weight: 700;
+          letter-spacing: 0.5px;
+        }
+        p {
+          margin: 0 0 ${lectura ? '16px' : '10px'};
+          text-align: center;
+          font-size: ${lectura ? '1.08em' : '1em'};
+        }
+        h1, h2, h3 {
+          text-align: center;
+          color: ${oscuro ? '#9ec5ff' : '#4165a0'};
+          margin: 0 0 20px;
+        }
+        img { max-width: 100%; height: auto; }
+        table { max-width: 100%; margin: auto; }
+        td, th { padding: 4px; vertical-align: top; }
+        a { color: ${oscuro ? '#a9c7ff' : '#1765cb'}; }
+        .word-clean p:empty { display:none; }
+        .lyric-part {font-weight:800 !important; letter-spacing:.45px; margin-top:20px !important;}
+        .lyric-intro, .lyric-instrumental, .lyric-verso, .lyric-puente, .lyric-final {color:${oscuro ? '#93c5fd' : '#173b77'} !important;}
+        .lyric-coro {color:${oscuro ? '#fda4af' : '#b91c1c'} !important;}
+      `;
+
+        iframe.srcdoc = `
+          <!DOCTYPE html>
+          <html lang="es">
+          <head>
+            <meta charset="UTF-8">
+            <meta name="viewport" content="width=device-width, initial-scale=1">
+            <style>${css}</style>
+          </head>
+          <body>${html}</body>
+          </html>
+        `;
+
+        overlay.querySelector('#vista-original').style.background = modo === 'original' ? '#1372ee' : '#eaf2ff';
+        overlay.querySelector('#vista-original').style.color = modo === 'original' ? '#fff' : '#1763c1';
+        overlay.querySelector('#vista-lectura').style.background = modo === 'lectura' ? '#1372ee' : '#eaf2ff';
+        overlay.querySelector('#vista-lectura').style.color = modo === 'lectura' ? '#fff' : '#1763c1';
+      }
+
+      overlay.querySelector('#vista-original').addEventListener('click', () => { modo = 'original'; actualizarVisor(); });
+      overlay.querySelector('#vista-lectura').addEventListener('click', () => { modo = 'lectura'; actualizarVisor(); });
+      overlay.querySelector('#letra-mas').addEventListener('click', () => { tamano = Math.min(tamano + 2, 36); actualizarVisor(); });
+      overlay.querySelector('#letra-menos').addEventListener('click', () => { tamano = Math.max(tamano - 2, 12); actualizarVisor(); });
+      overlay.querySelector('#modo-oscuro').addEventListener('click', () => { oscuro = !oscuro; actualizarVisor(); });
+      overlay.querySelector('#pantalla-completa').addEventListener('click', async () => {
+        const ventana = overlay.querySelector('.modal');
+        if (!document.fullscreenElement) {
+          await ventana.requestFullscreen();
+          ventana.style.width = '100%';
+          ventana.style.maxHeight = '100dvh';
+          iframe.style.height = 'calc(100dvh - 200px)';
+        } else {
+          await document.exitFullscreen();
+          iframe.style.height = '68dvh';
+        }
+      });
+
+      actualizarVisor();
+    } catch (error) {
+      console.error(error);
+      toast('Error al visualizar Word: ' + error.message);
     }
-
-
-  ;
+    return;
+  }
 }
 
 function showTextViewer(title, text, path, type) {
@@ -1575,7 +1467,7 @@ async function showImageViewer(title, path) {
     const loading = document.getElementById('img-loading');
     if (img) { img.src = url; img.style.display = 'inline-block'; }
     if (loading) loading.style.display = 'none';
-    detectOfflineFiles().then(() => {}); // refrescar cache
+    detectOfflineFiles().then(() => {});
   } catch (e) {
     const loading = document.getElementById('img-loading');
     if (loading) loading.textContent = 'No se pudo cargar la imagen: ' + e.message;
@@ -1689,15 +1581,26 @@ function saveFields(s) {
 
 // --- Acciones ---
 async function act(action, id, section) {
-  
   if (action === 'prepare-offline') {
     await prepareOfflineLibrary();
     return;
   }
+  if (action === 'download-lyrics-word') { downloadLyricsAsWord(); return; }
 
   if (action === 'retry') { await refresh(); return; }
-  if (action === 'logout') { if (!navigator.onLine) { toast('Para cerrar sesión de forma segura, reconéctate a internet.'); return; } const uid = currentUser?.id; if (supa) await supa.auth.signOut(); currentUser = null; if (uid) await clearOfflineUser(uid); songs = []; services = []; artists = []; render(); return; }
-  if (!['retry','logout','menu','close-modal','toggle-artist','view-file','view-manual','download-file'].includes(action) && !requireInternet()) return;
+  if (action === 'logout') {
+    if (!navigator.onLine) { toast('Para cerrar sesión de forma segura, reconéctate a internet.'); return; }
+    const uid = currentUser?.id;
+    if (supa) await supa.auth.signOut();
+    currentUser = null;
+    if (uid) await clearOfflineUser(uid);
+    songs = []; services = []; artists = [];
+    render();
+    return;
+  }
+
+  if (!['retry','logout','menu','close-modal','toggle-artist','view-file','view-manual','download-file','download-lyrics-word'].includes(action) && !requireInternet()) return;
+
   if (action === 'menu') { mobileMenu = !mobileMenu; render(); return; }
   if (action === 'new-song') { newSongModal(); return; }
   if (action === 'bulk-import') { bulkImportModal(); return; }
@@ -1731,7 +1634,6 @@ async function act(action, id, section) {
     return;
   }
 
-  // Servicios
   if (action === 'new-service') {
     const type = id === 'evento' ? 'evento' : 'normal';
     const name = type === 'evento' ? 'Matrimonio / Evento' : 'Nuevo servicio';
@@ -1841,6 +1743,7 @@ function filterAddSongResults() {
     (!query || normalize(s.name + ' ' + artistName(s.artistId)).includes(query))
   ).sort((a,b) => a.name.localeCompare(b.name, 'es')));
 }
+
 document.addEventListener('input', e => {
   if (e.target.id === 'song-manual-text' || (e.target.name === 'name' && e.target.closest('#song-form'))) updateLyricsPreview();
   if (e.target.id === 'search') {
@@ -1950,7 +1853,6 @@ document.addEventListener('submit', async e => {
         s.files[key] = uploaded;
         if (old?.path) pendingCleanup.push(old.path);
 
-        // Extraer texto si es PDF o Word
         if (key === 'pdf' || key === 'word') {
           const texto = await extractText(f);
           if (texto) s.contenidoTexto = texto;
@@ -1984,7 +1886,6 @@ async function initAuth() {
     return;
   }
   try {
-    // getSession recupera la sesión local sin exigir red. NO solicita credenciales nuevas.
     const local = await supa.auth.getSession();
     const savedUser = local.data?.session?.user || null;
     currentUser = savedUser;
@@ -1998,7 +1899,6 @@ async function initAuth() {
   authReady = true;
   await refresh();
   supa.auth.onAuthStateChange((event, session) => {
-    // Evita borrar la biblioteca local ante fallos temporales de conexión.
     if (!navigator.onLine && event !== 'SIGNED_OUT') return;
     if (event === 'SIGNED_OUT') {
       currentUser = null;
@@ -2013,7 +1913,6 @@ async function initAuth() {
   });
 }
 
-// Precarga de recursos para abrir la interfaz offline, incluidos los CDN usados.
 if ('serviceWorker' in navigator) {
   window.addEventListener('load', () => {
     navigator.serviceWorker.register('./sw.js').catch(e => console.warn('SW no disponible', e));
