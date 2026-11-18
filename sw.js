@@ -1,6 +1,6 @@
 // Service Worker: interfaz offline. Los documentos privados NO se almacenan aquí.
-const VERSION = 'yahweh-shell-1';
-const APP_FILES = ['./', './index.html', './styles.css', './app.js', './config.js', './manifest.webmanifest'];
+const VERSION = 'yahweh-shell-8';
+const APP_FILES = ['./', './index.html', './styles.css', './app.js', './word-export.js', './config.js', './manifest.webmanifest', './paloma.png', './icon.svg'];
 const LIBS = [
   'https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2/dist/umd/supabase.min.js',
   'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js',

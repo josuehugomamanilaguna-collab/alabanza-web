@@ -18,17 +18,19 @@ let isOnline = navigator.onLine;
 let offlineMode = false;
 let snapshotAvailable = false;
 const OFFLINE_DB_NAME = 'alabanza-local-v3';
+const OFFLINE_PROFILE_KEY = 'alabanza-last-user-v1';
 
 // --- IndexedDB para cache offline ---
 let db;
 const op = new Promise((resolve, reject) => {
-  let r = indexedDB.open(OFFLINE_DB_NAME, 1);
+  let r = indexedDB.open(OFFLINE_DB_NAME, 2);
   r.onupgradeneeded = () => {
     let d = r.result;
     if (!d.objectStoreNames.contains('songs')) d.createObjectStore('songs', { keyPath: 'id' });
     if (!d.objectStoreNames.contains('services')) d.createObjectStore('services', { keyPath: 'id' });
     if (!d.objectStoreNames.contains('files')) d.createObjectStore('files', { keyPath: 'id' });
     if (!d.objectStoreNames.contains('snapshots')) d.createObjectStore('snapshots', { keyPath: 'id' });
+    if (!d.objectStoreNames.contains('pendingServices')) d.createObjectStore('pendingServices', { keyPath: 'id' });
   };
   r.onsuccess = () => { db = r.result; resolve(); };
   r.onerror = () => reject(r.error);
@@ -47,6 +49,27 @@ const normalize = s => String(s || '').normalize('NFD').replace(/[\u0300-\u036f]
 function tx(store, mode = 'readonly') { return db.transaction(store, mode).objectStore(store); }
 function req(request) { return new Promise((resolve, reject) => { request.onsuccess = () => resolve(request.result); request.onerror = () => reject(request.error); }); }
 
+function saveOfflineProfile(user = currentUser) {
+  try {
+    if (!user?.id) return;
+    localStorage.setItem(OFFLINE_PROFILE_KEY, JSON.stringify({
+      id: user.id,
+      email: user.email || '',
+      user_metadata: user.user_metadata || {},
+      savedAt: Date.now()
+    }));
+  } catch (e) { console.warn('No se pudo guardar el perfil offline', e); }
+}
+function getOfflineProfile() {
+  try {
+    const raw = localStorage.getItem(OFFLINE_PROFILE_KEY);
+    return raw ? JSON.parse(raw) : null;
+  } catch (e) { return null; }
+}
+function clearOfflineProfile() {
+  try { localStorage.removeItem(OFFLINE_PROFILE_KEY); } catch (e) {}
+}
+
 function offlineKey(path) { return `${currentUser?.id || 'sin-usuario'}:${path}`; }
 async function saveSnapshot() {
   if (!currentUser || offlineMode) return;
@@ -56,6 +79,7 @@ async function saveSnapshot() {
     savedAt: Date.now()
   };
   await req(tx('snapshots', 'readwrite').put(snapshot));
+  saveOfflineProfile(currentUser);
   snapshotAvailable = true;
 }
 async function loadSnapshot() {
@@ -79,7 +103,11 @@ async function clearOfflineUser(uid) {
   const keys = await req(store.getAllKeys());
   await Promise.all(keys.filter(k => String(k).startsWith(uid + ':'))
     .map(k => req(tx('files', 'readwrite').delete(k))));
+  const pending = await req(tx('pendingServices').getAllKeys());
+  for (const key of pending.filter(k => String(k).startsWith(uid + ':'))) await req(tx('pendingServices', 'readwrite').delete(key));
   offlineFiles.clear();
+  const saved = getOfflineProfile();
+  if (saved?.id === uid) clearOfflineProfile();
   snapshotAvailable = false;
 }
 function requireInternet() {
@@ -195,6 +223,7 @@ async function refresh() {
   }
   try {
     offlineMode = false;
+    await syncPendingServices();
     await fetchCloud();
     cloudProblem = '';
   } catch (e) {
@@ -210,6 +239,46 @@ async function refresh() {
   render();
 }
 
+// Los cambios de servicios sin conexión se guardan por cuenta y se sincronizan
+// cuando vuelva internet. La última edición realizada prevalece en caso de conflicto.
+async function pendingServices() {
+  await op;
+  return (await req(tx('pendingServices').getAll())).filter(x => x.userId === currentUser?.id);
+}
+async function storeServiceOffline(service) {
+  if (!currentUser) throw Error('Debes iniciar sesión previamente para editar sin conexión.');
+  await op;
+  await req(tx('pendingServices', 'readwrite').put({ id: offlineKey('servicio:' + service.id), userId: currentUser.id, service: structuredClone(service) }));
+  const pos = services.findIndex(x => x.id === service.id);
+  if (pos >= 0) services[pos] = service; else services.push(service);
+  const snapshot = await req(tx('snapshots').get(currentUser.id));
+  if (snapshot) {
+    snapshot.services = structuredClone(services);
+    snapshot.savedAt = Date.now();
+    await req(tx('snapshots', 'readwrite').put(snapshot));
+  }
+}
+async function syncPendingServices() {
+  if (!currentUser || !navigator.onLine) return;
+  for (const entry of await pendingServices()) {
+    await putServiceCloud(entry.service);
+    await req(tx('pendingServices', 'readwrite').delete(entry.id));
+  }
+}
+async function putServiceCloud(val) {
+  checked(await supa.from('servicios').upsert({
+    id: val.id, nombre: val.name, fecha: val.date || new Date().toLocaleDateString('en-CA'),
+    descripcion: val.description || '', tipo_servicio: val.type || 'normal', creado_por: currentUser.id
+  }));
+  const existing = checked(await supa.from('repertorio').select('id').eq('servicio_id', val.id));
+  const ids = new Set(val.items.map(i => i.id));
+  const removed = existing.filter(i => !ids.has(i.id)).map(i => i.id);
+  if (removed.length) checked(await supa.from('repertorio').delete().in('id', removed));
+  if (val.items.length) checked(await supa.from('repertorio').upsert(val.items.map((i,index) => ({
+    id: i.id, servicio_id: val.id, cancion_id: i.songId, seccion: i.section,
+    tonalidad: i.tone || null, orden: index
+  }))));
+}
 // --- Guardar / Eliminar ---
 async function put(store, val) {
   if (store === 'songs') {
@@ -217,28 +286,10 @@ async function put(store, val) {
     return;
   }
   if (store === 'services') {
-    checked(await supa.from('servicios').upsert({
-      id: val.id,
-      nombre: val.name,
-      fecha: val.date || new Date().toLocaleDateString('en-CA'),
-      descripcion: val.description || '',
-      tipo_servicio: val.type || 'normal',
-      creado_por: currentUser.id
-    }));
-    const existing = checked(await supa.from('repertorio').select('id').eq('servicio_id', val.id));
-    const ids = new Set(val.items.map(i => i.id));
-    const removed = existing.filter(i => !ids.has(i.id)).map(i => i.id);
-    if (removed.length) checked(await supa.from('repertorio').delete().in('id', removed));
-    if (val.items.length) {
-      checked(await supa.from('repertorio').upsert(val.items.map((i, index) => ({
-        id: i.id,
-        servicio_id: val.id,
-        cancion_id: i.songId,
-        seccion: i.section,
-        tonalidad: i.tone || null,
-        orden: index
-      }))));
-    }
+    // En caso de desconexión también preserva la edición local.
+    if (!navigator.onLine || offlineMode) { await storeServiceOffline(val); return; }
+    try { await putServiceCloud(val); }
+    catch(e) { await storeServiceOffline(val); throw e; }
     return;
   }
   if (store === 'artists') {
@@ -342,11 +393,76 @@ function lyricHeadingClass(text) {
   const key = normalize(text).replace(/\s*[:：.\-–]\s*$/, '').replace(/\s+/g, ' ').toUpperCase();
   return LYRIC_HEADINGS.get(key) || '';
 }
+// Repara letras antiguas donde un solo color envolvió varios párrafos.
+// Cada línea se colorea por separado, sin modificar su contenido musical.
+function normalizeLyricMarkup(value) {
+  return String(value || '').replace(/\r\n?/g, '\n').replace(/\{(#[0-9a-fA-F]{6})\|([\s\S]*?)\}/g, (full, color, content) => {
+    if (!content.includes('\n')) return full;
+    return content.split('\n').map(line => line.trim() ? `{${color}|${line}}` : line).join('\n');
+  });
+}
+// Formato portable: **negrita** y {#RRGGBB|texto coloreado}.
+// Nunca interpretamos HTML introducido por el usuario.
+function lyricInlineHtml(raw) {
+  const pattern = /(\*\*([^*\n]+)\*\*|\{(#[0-9a-fA-F]{6})\|([^}\n]*)\})/g;
+  let out = '', last = 0, match;
+  while ((match = pattern.exec(raw)) !== null) {
+    out += escapeHtml(raw.slice(last, match.index));
+    if (match[2] !== undefined) out += `<strong>${escapeHtml(match[2])}</strong>`;
+    else out += `<span style="color:${match[3]}">${escapeHtml(match[4]).replace(/\*\*([^*]+)\*\*/g, '<strong>$1</strong>')}</span>`;
+    last = pattern.lastIndex;
+  }
+  return out + escapeHtml(raw.slice(last));
+}
+function lyricPlainText(line) { return line.replace(/\*\*([^*\n]+)\*\*/g,'$1').replace(/\{#[0-9a-fA-F]{6}\|([^}\n]*)\}/g,'$1'); }
 function lyricLinesHtml(text) {
-  return String(text || '').replace(/\r\n?/g, '\n').split('\n').map(line => {
-    const kind = lyricHeadingClass(line);
-    return `<p class="lyric-line ${kind ? 'lyric-part lyric-' + kind : ''}">${escapeHtml(line) || '&nbsp;'}</p>`;
+  return normalizeLyricMarkup(text).split('\n').map(line => {
+    const kind = lyricHeadingClass(lyricPlainText(line));
+    return `<p class="lyric-line ${kind ? 'lyric-part lyric-' + kind : ''}">${lyricInlineHtml(line) || '&nbsp;'}</p>`;
   }).join('');
+}
+function lyricDovesHtml() {
+  return '<div class="lyric-doves"><img src="paloma.png" alt="Paloma izquierda"><img src="paloma.png" alt="Paloma derecha"></div>';
+}
+function formatLyricsSelection(type) {
+  const field = document.getElementById('song-manual-text');
+  if (!field) return;
+  const start = field.selectionStart, end = field.selectionEnd;
+  const value = field.value;
+  // Sin selección: no agregar palabras falsas a la letra.
+  if (start === end) { toast('Primero selecciona las palabras o líneas que deseas modificar.'); field.focus(); return; }
+  const chosen = value.slice(start, end);
+  const color = document.getElementById('lyric-color')?.value || '#2563eb';
+  let replacement = chosen;
+  if (type === 'bold') {
+    // Permite seleccionar párrafos: cada línea queda correctamente formateada.
+    replacement = chosen.split('\n').map(line => line.trim() ? `**${line}**` : line).join('\n');
+  } else if (type === 'color') {
+    // El código de color no puede abarcar varias líneas; evita {#HEX|párrafo...}.
+    // Si ya había otro color, lo sustituye sin anidar etiquetas incompatibles.
+    const uncolored = normalizeLyricMarkup(chosen).replace(/\{#[0-9a-fA-F]{6}\|([^}\n]*)\}/g, '$1');
+    replacement = uncolored.split('\n').map(line => line.trim() ? `{${color}|${line}}` : line).join('\n');
+  } else if (type === 'upper') {
+    // Se cambia solo la selección, conservando los delimitadores de color y negrita.
+    replacement = chosen.toLocaleUpperCase('es');
+  } else return;
+  field.setRangeText(replacement, start, end, 'select');
+  field.focus();
+  updateLyricsPreview();
+}
+function insertLyricsHeading(heading) {
+  const field = document.getElementById('song-manual-text'); if (!field) return;
+  const at = field.selectionStart;
+  field.setRangeText(`${at && field.value[at-1] !== '\n' ? '\n' : ''}${heading}\n`,at,at,'end');
+  field.focus(); updateLyricsPreview();
+}
+function openSongForReading(id) {
+  const s = songs.find(x => x.id === id);
+  if (!s) return;
+  if (s.contenidoTexto?.trim()) { manualLyricsViewer(id); return; }
+  const choice = s.files?.pdf || s.files?.word || s.files?.image || s.files?.chords;
+  if (choice) { viewFile(choice.id, s.files?.pdf ? 'pdf' : s.files?.word ? 'word' : s.files?.image ? 'image' : 'pdf'); return; }
+  toast('Esta canción no tiene letra ni documento todavía.');
 }
 function markWordHeadings(container) {
   container.querySelectorAll('p').forEach(p => {
@@ -355,10 +471,246 @@ function markWordHeadings(container) {
   });
 }
 
+function serviceExportSections(service) {
+  const sectionOrder = [...new Set((service.items || []).map(i => i.section || 'General'))];
+  return sectionOrder.map(section => ({
+    name: section || 'General',
+    items: (service.items || []).filter(i => (i.section || 'General') === (section || 'General')).map((item, index) => {
+      const song = songs.find(x => x.id === item.songId);
+      return {
+        index: index + 1,
+        name: song?.name || 'Canción eliminada',
+        artist: song ? (songArtistLabel(song) || '') : '',
+        tone: item.tone || song?.tone || ''
+      };
+    })
+  }));
+}
+
+function serviceExportTitle(service) {
+  return `${service.name || 'Repertorio'}${service.date ? ' — ' + service.date : ''}`;
+}
+
+function wrapCanvasText(ctx, text, maxWidth) {
+  const words = String(text || '').split(/\s+/).filter(Boolean);
+  if (!words.length) return [''];
+  const lines = [];
+  let current = words[0];
+  for (const word of words.slice(1)) {
+    const probe = current + ' ' + word;
+    if (ctx.measureText(probe).width <= maxWidth) current = probe;
+    else { lines.push(current); current = word; }
+  }
+  lines.push(current);
+  return lines;
+}
+
+function roundRect(ctx, x, y, width, height, radius, fill, stroke) {
+  if (typeof radius === 'number') radius = { tl: radius, tr: radius, br: radius, bl: radius };
+  ctx.beginPath();
+  ctx.moveTo(x + radius.tl, y);
+  ctx.lineTo(x + width - radius.tr, y);
+  ctx.quadraticCurveTo(x + width, y, x + width, y + radius.tr);
+  ctx.lineTo(x + width, y + height - radius.br);
+  ctx.quadraticCurveTo(x + width, y + height, x + width - radius.br, y + height);
+  ctx.lineTo(x + radius.bl, y + height);
+  ctx.quadraticCurveTo(x, y + height, x, y + height - radius.bl);
+  ctx.lineTo(x, y + radius.tl);
+  ctx.quadraticCurveTo(x, y, x + radius.tl, y);
+  ctx.closePath();
+  if (fill) ctx.fill();
+  if (stroke) ctx.stroke();
+}
+
+function buildServiceExportCanvas(service) {
+  const width = 1400, margin = 78;
+  const temp = document.createElement('canvas');
+  const ctx = temp.getContext('2d');
+  const sections = serviceExportSections(service);
+  const lineHeight = 34;
+  let height = 220;
+  ctx.font = '700 28px Inter, Arial, sans-serif';
+  for (const section of sections) {
+    height += 56;
+    for (const item of section.items) {
+      const detail = `${item.index}. ${item.name}${item.artist ? ' — ' + item.artist : ''}${item.tone ? ' · Tono ' + item.tone : ''}`;
+      const lines = wrapCanvasText(ctx, detail, width - margin * 2 - 28);
+      height += Math.max(1, lines.length) * lineHeight + 12;
+    }
+    height += 14;
+  }
+  height += 80;
+  temp.width = width;
+  temp.height = Math.max(height, 900);
+
+  const g = ctx.createLinearGradient(0, 0, width, temp.height);
+  g.addColorStop(0, '#eff6ff');
+  g.addColorStop(.5, '#ffffff');
+  g.addColorStop(1, '#f5f3ff');
+  ctx.fillStyle = g;
+  ctx.fillRect(0, 0, width, temp.height);
+  const bubble = ctx.createRadialGradient(width, 0, 0, width, 0, 300);
+  bubble.addColorStop(0, 'rgba(37,99,235,.12)');
+  bubble.addColorStop(1, 'rgba(37,99,235,0)');
+  ctx.fillStyle = bubble;
+  ctx.fillRect(0, 0, width, temp.height);
+
+  ctx.fillStyle = '#102c45';
+  ctx.font = '700 48px Inter, Arial, sans-serif';
+  ctx.fillText(service.name || 'Repertorio', margin, 78);
+  ctx.font = '600 22px Inter, Arial, sans-serif';
+  ctx.fillStyle = '#57708f';
+  ctx.fillText(service.type === 'evento' ? 'Evento especial' : 'Servicio / repertorio', margin, 116);
+  ctx.fillText(service.date ? 'Fecha: ' + service.date : 'Fecha: sin definir', margin, 148);
+  ctx.fillText('Total de canciones: ' + ((service.items || []).length), margin, 180);
+
+  let y = 230;
+  for (const [idx, section] of sections.entries()) {
+    ctx.fillStyle = idx % 2 ? '#ecfeff' : '#eef2ff';
+    roundRect(ctx, margin, y - 30, width - margin * 2, 46, 18, true, false);
+    ctx.fillStyle = '#1e3a8a';
+    ctx.font = '700 24px Inter, Arial, sans-serif';
+    ctx.fillText(section.name.toUpperCase(), margin + 18, y);
+    y += 32;
+    for (const item of section.items) {
+      ctx.font = '600 28px Inter, Arial, sans-serif';
+      ctx.fillStyle = '#16324f';
+      const detail = `${item.index}. ${item.name}${item.artist ? ' — ' + item.artist : ''}${item.tone ? ' · Tono ' + item.tone : ''}`;
+      const lines = wrapCanvasText(ctx, detail, width - margin * 2 - 28);
+      for (const line of lines) {
+        ctx.fillText(line, margin + 14, y + 22);
+        y += lineHeight;
+      }
+      y += 12;
+    }
+    y += 18;
+  }
+  ctx.font = '500 18px Inter, Arial, sans-serif';
+  ctx.fillStyle = '#6b7e95';
+  ctx.fillText('Ministerio de Alabanza Yahweh — Lista exportada desde el sistema', margin, temp.height - 34);
+  return temp;
+}
+
+function downloadBlob(blob, filename) {
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = filename;
+  document.body.append(a);
+  a.click();
+  a.remove();
+  setTimeout(() => URL.revokeObjectURL(url), 1600);
+}
+
+function sanitizeFilename(name) {
+  return String(name || 'archivo').replace(/[\/:*?"<>|]+/g, '').replace(/\s+/g, ' ').trim();
+}
+
+async function downloadServiceAsPng(service) {
+  const canvas = buildServiceExportCanvas(service);
+  const blob = await new Promise(resolve => canvas.toBlob(resolve, 'image/png'));
+  if (!blob) { toast('No se pudo generar el PNG.'); return; }
+  downloadBlob(blob, sanitizeFilename(serviceExportTitle(service)) + '.png');
+  toast('Lista del repertorio descargada en PNG');
+}
+
+function pdfEscape(text) {
+  return String(text || '').replace(/\\/g, '\\\\').replace(/\(/g, '\\(').replace(/\)/g, '\\)');
+}
+
+function downloadServiceAsPdf(service) {
+  const sections = serviceExportSections(service);
+  const pageWidth = 595.28, pageHeight = 841.89, margin = 44, lineHeight = 16;
+  const maxChars = 78;
+  const pages = [];
+  let current = [];
+  let y = pageHeight - margin;
+
+  const pushLine = (text, size = 12) => {
+    if (y < margin + 20) { pages.push(current); current = []; y = pageHeight - margin; }
+    current.push({ text, y, size });
+    y -= lineHeight + (size > 12 ? 4 : 0);
+  };
+
+  const wrapText = text => {
+    const words = String(text || '').split(/\s+/).filter(Boolean);
+    if (!words.length) return [''];
+    const lines = [];
+    let line = words[0];
+    for (const word of words.slice(1)) {
+      if ((line + ' ' + word).length <= maxChars) line += ' ' + word;
+      else { lines.push(line); line = word; }
+    }
+    lines.push(line);
+    return lines;
+  };
+
+  pushLine(service.name || 'Repertorio', 18);
+  pushLine(service.type === 'evento' ? 'Evento especial' : 'Servicio / repertorio', 12);
+  pushLine(service.date ? 'Fecha: ' + service.date : 'Fecha: sin definir', 12);
+  pushLine('Total de canciones: ' + ((service.items || []).length), 12);
+  if (service.description) pushLine('Descripción: ' + service.description, 12);
+  pushLine('', 12);
+
+  for (const section of sections) {
+    pushLine(section.name.toUpperCase(), 14);
+    for (const item of section.items) {
+      const detail = `${item.index}. ${item.name}${item.artist ? ' — ' + item.artist : ''}${item.tone ? ' · Tono ' + item.tone : ''}`;
+      for (const line of wrapText(detail)) pushLine(line, 12);
+    }
+    pushLine('', 12);
+  }
+  if (current.length) pages.push(current);
+
+  const pageDefs = [];
+  for (const pageLines of pages) {
+    let stream = 'BT\n';
+    for (const line of pageLines) {
+      stream += `/F1 ${line.size} Tf 1 0 0 1 ${margin} ${line.y.toFixed(2)} Tm (${pdfEscape(line.text)}) Tj\n`;
+    }
+    stream += 'ET';
+    pageDefs.push(stream);
+  }
+
+  const objectCount = 3 + pageDefs.length * 2;
+  const fontNum = objectCount;
+  const pageNums = [];
+  const contentNums = [];
+  for (let i = 0; i < pageDefs.length; i++) {
+    pageNums.push(3 + i * 2);
+    contentNums.push(4 + i * 2);
+  }
+
+  const objs = new Array(objectCount + 1).fill('');
+  objs[1] = '<< /Type /Catalog /Pages 2 0 R >>';
+  objs[2] = `<< /Type /Pages /Count ${pageDefs.length} /Kids [ ${pageNums.map(n => `${n} 0 R`).join(' ')} ] >>`;
+  for (let i = 0; i < pageDefs.length; i++) {
+    objs[pageNums[i]] = `<< /Type /Page /Parent 2 0 R /MediaBox [0 0 ${pageWidth} ${pageHeight}] /Contents ${contentNums[i]} 0 R /Resources << /Font << /F1 ${fontNum} 0 R >> >> >>`;
+    objs[contentNums[i]] = `<< /Length ${pageDefs[i].length} >>\nstream\n${pageDefs[i]}\nendstream`;
+  }
+  objs[fontNum] = '<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>';
+
+  let pdf = '%PDF-1.4\n';
+  const offsets = ['0000000000 65535 f '];
+  for (let i = 1; i <= objectCount; i++) {
+    offsets[i] = String(pdf.length).padStart(10, '0') + ' 00000 n ';
+    pdf += `${i} 0 obj\n${objs[i]}\nendobj\n`;
+  }
+  const xrefStart = pdf.length;
+  pdf += `xref\n0 ${objectCount + 1}\n`;
+  pdf += offsets.join('\n') + '\n';
+  pdf += `trailer\n<< /Size ${objectCount + 1} /Root 1 0 R >>\nstartxref\n${xrefStart}\n%%EOF`;
+
+  const blob = new Blob([pdf], { type: 'application/pdf' });
+  downloadBlob(blob, sanitizeFilename(serviceExportTitle(service)) + '.pdf');
+  toast('Lista del repertorio descargada en PDF');
+}
+
 function manualLyricsViewer(song) {
   const s = songs.find(x => x.id === song);
   if (!s?.contenidoTexto?.trim()) { toast('Esta canción todavía no tiene una letra escrita.'); return; }
   let size = 19, dark = false;
+  const artist = songArtistLabel(s);
   modal(s.name + ' — Letra', `
     <div class="row" style="margin-bottom:12px">
       <button class="btn secondary small" id="manual-less">A−</button>
@@ -368,8 +720,9 @@ function manualLyricsViewer(song) {
       <button class="btn secondary small" id="manual-download-word">⬇️ Word</button>
     </div>
     <div class="manual-lyric-page" id="manual-lyric-page">
-      <div class="lyric-doves"><span aria-hidden="true">🕊️</span><span aria-hidden="true">🕊️</span></div>
+      ${lyricDovesHtml()}
       <h2 class="lyric-title">${escapeHtml(s.name)}</h2>
+      ${artist ? `<div class="lyric-author">${escapeHtml(artist)}</div>` : ''}
       <div class="lyric-body">${lyricLinesHtml(s.contenidoTexto)}</div>
     </div>`, { wide: true });
   const overlay = document.getElementById('overlay');
@@ -383,108 +736,48 @@ function manualLyricsViewer(song) {
     catch (e) { toast('Pantalla completa no disponible en este dispositivo.'); }
   };
   overlay.querySelector('#manual-download-word').onclick = () =>
-    downloadLyricsAsWordFromData(s.name, s.contenidoTexto);
+    downloadLyricsAsWordFromData(s.name, s.contenidoTexto, artist);
   update();
 }
 
-// Genera y descarga un .doc con formato de palomitas
-function downloadLyricsAsWordFromData(title, text) {
-  title = (title || 'CANCIÓN').trim() || 'CANCIÓN';
-  text = text || '';
-
-  if (!text.trim()) {
-    toast('No hay letra para descargar.');
-    return;
+// Exportación a Word DOCX real: imágenes de palomas, tipografía y formato nativo.
+async function downloadLyricsAsWordFromData(title, text, artist = '') {
+  try {
+    if (typeof exportLyricsDocx !== 'function') throw new Error('Falta cargar el módulo de exportación de Word.');
+    await exportLyricsDocx({
+      title, text, artist,
+      normalizer: normalizeLyricMarkup,
+      headingClass: lyricHeadingClass,
+      visibleArtist: visibleArtistLabel
+    });
+    toast('Word descargado: _PALOMAS_OFFLINE_V8.docx');
+  } catch (error) {
+    console.error('Error exportando Word', error);
+    toast('No se pudo crear el Word: ' + error.message);
   }
-
-  const headingFor = (line) => {
-    const key = normalize(line)
-      .replace(/\s*[:：.\-–]\s*$/, '')
-      .replace(/\s+/g, ' ')
-      .toUpperCase();
-    return LYRIC_HEADINGS.get(key) || '';
-  };
-
-  const colorFor = (kind) => {
-    if (kind === 'coro') return '#b91c1c';
-    if (kind === 'intro' || kind === 'instrumental' || kind === 'verso' ||
-        kind === 'puente' || kind === 'final') return '#173b77';
-    return '#1f2937';
-  };
-
-  const lines = String(text).replace(/\r\n?/g, '\n').split('\n');
-
-  const bodyHtml = lines.map(line => {
-    const kind = headingFor(line);
-    if (kind) {
-      return `<p style="margin:22px 0 8px;text-align:center;font-weight:bold;font-size:13pt;letter-spacing:0.5pt;color:${colorFor(kind)};">${escapeHtml(line)}</p>`;
-    }
-    return `<p style="margin:0 0 6px;text-align:center;font-size:12pt;line-height:1.6;">${escapeHtml(line) || '&nbsp;'}</p>`;
-  }).join('');
-
-  const html = `
-    <html xmlns:o="urn:schemas-microsoft-com:office:office"
-          xmlns:w="urn:schemas-microsoft-com:office:word"
-          xmlns="http://www.w3.org/TR/REC-html40">
-    <head>
-      <meta charset="utf-8">
-      <title>${escapeHtml(title)}</title>
-      <!--[if gte mso 9]>
-      <xml><w:WordDocument><w:View>Print</w:View><w:Zoom>100</w:Zoom></w:WordDocument></xml>
-      <![endif]-->
-      <style>
-        @page { size: A4; margin: 2cm; }
-        body { font-family: Arial, Helvetica, sans-serif; color: #1f2937; }
-        .doves { width: 100%; margin-bottom: 8px; }
-        .doves td { font-size: 26pt; }
-        .title { text-align: center; font-size: 18pt; font-weight: bold;
-                 color: #355fa1; text-transform: uppercase; margin: 4px 0 26px; }
-      </style>
-    </head>
-    <body>
-      <table class="doves" width="100%">
-        <tr>
-          <td align="left" style="font-size:26pt;">&#128330;</td>
-          <td align="right" style="font-size:26pt;">&#128330;</td>
-        </tr>
-      </table>
-      <p class="title">${escapeHtml(title)}</p>
-      ${bodyHtml}
-    </body>
-    </html>
-  `;
-
-  const blob = new Blob(['\ufeff', html], { type: 'application/msword' });
-  const url = URL.createObjectURL(blob);
-  const a = document.createElement('a');
-  a.href = url;
-  a.download = title.replace(/[^\w\s\-áéíóúÁÉÍÓÚñÑ]/g, '').trim() + '.doc';
-  document.body.append(a);
-  a.click();
-  a.remove();
-  setTimeout(() => URL.revokeObjectURL(url), 1500);
-
-  toast('Letra descargada en Word 🕊️');
 }
 
 // Versión para el formulario
 function downloadLyricsAsWord() {
   const field = document.getElementById('song-manual-text');
   const titleInput = document.querySelector('#song-form [name="name"]');
+  const artistLabel = visibleArtistLabel(document.querySelector('#song-form [name="artistId"] option:checked')?.textContent || '');
   if (!field) {
     toast('Abre primero el formulario de la canción.');
     return;
   }
-  downloadLyricsAsWordFromData(titleInput?.value || 'CANCIÓN', field.value || '');
+  downloadLyricsAsWordFromData(titleInput?.value || 'CANCIÓN', field.value || '', artistLabel);
 }
 
 function updateLyricsPreview() {
   const field = document.getElementById('song-manual-text');
   const title = document.querySelector('#song-form [name="name"]');
   const preview = document.getElementById('song-manual-preview');
+  const artist = visibleArtistLabel(document.querySelector('#song-form [name="artistId"] option:checked')?.textContent || '');
   if (!preview || !field) return;
-  preview.innerHTML = `<div class="lyric-doves"><span>🕊️</span><span>🕊️</span></div>
+  preview.innerHTML = `${lyricDovesHtml()}
     <h3 class="lyric-title">${escapeHtml(title?.value || 'NOMBRE DE LA CANCIÓN')}</h3>
+    ${artist ? `<div class="lyric-author">${escapeHtml(artist)}</div>` : ''}
     <div class="lyric-body">${lyricLinesHtml(field.value)}</div>`;
 }
 
@@ -625,9 +918,68 @@ function catIcon(name) { return catByName(name)?.icono || '♫'; }
 
 // --- Artistas helpers ---
 function artistName(id) { return artists.find(a => a.id === id)?.nombre || ''; }
+function visibleArtistLabel(name) {
+  const raw = String(name || '').trim();
+  if (!raw) return '';
+  const key = normalize(raw).replace(/[—-]/g, ' ').replace(/\s+/g, ' ').trim();
+  if (!key || ['sin artista','ninguno','ninguno / no aplica','no aplica','none'].includes(key)) return '';
+  return raw;
+}
+function songArtistLabel(song) {
+  return visibleArtistLabel(song?.artistId ? artistName(song.artistId) : '');
+}
 function artistOptions(selectedId, includeEmpty = true) {
   const opts = artists.map(a => `<option value="${a.id}" ${a.id === selectedId ? 'selected' : ''}>${escapeHtml(a.nombre)}</option>`).join('');
-  return (includeEmpty ? `<option value="">— Sin artista —</option>` : '') + opts;
+  return (includeEmpty ? `<option value="">Ninguno / no aplica</option>` : '') + opts;
+}
+
+const VISUAL_THEMES = {
+  'inicio': { icon: '🏠', cls: 'theme-blue' },
+  'biblioteca completa': { icon: '🎼', cls: 'theme-indigo' },
+  'adoracion': { icon: '🤍', cls: 'theme-rose' },
+  'gozo': { icon: '🎵', cls: 'theme-mint' },
+  'juvenil': { icon: '👑', cls: 'theme-violet' },
+  'paitan': { icon: '🎁', cls: 'theme-amber' },
+  'otro': { icon: '✨', cls: 'theme-sky' },
+  'artistas y bandas': { icon: '🎤', cls: 'theme-cyan' },
+  'servicios': { icon: '🗂️', cls: 'theme-gold' }
+};
+function themeMeta(label, fallbackIcon = '🎵') {
+  const key = normalize(label);
+  return VISUAL_THEMES[key] || { icon: fallbackIcon, cls: 'theme-blue' };
+}
+// Iconografía SVG local: nítida, coherente y disponible sin conexión.
+const UI_ICONS = {
+  home: '<path d="m3 10 9-7 9 7v10a1 1 0 0 1-1 1H4a1 1 0 0 1-1-1V10Z"/><path d="M9 21v-8h6v8"/>',
+  book: '<rect x="4" y="3" width="16" height="18" rx="2"/><path d="M8 3v18M12 8h5M12 12h5"/>',
+  heart: '<path d="M20.8 4.6a5.5 5.5 0 0 0-7.8 0L12 5.7l-1.1-1.1a5.5 5.5 0 0 0-7.8 7.8L12 21l8.8-8.6a5.5 5.5 0 0 0 0-7.8Z"/>',
+  music: '<path d="M9 18V5l12-2v13"/><ellipse cx="6" cy="18" rx="3" ry="2"/><ellipse cx="18" cy="16" rx="3" ry="2"/>',
+  crown: '<path d="m2 8 5 4 5-7 5 7 5-4-2 12H4L2 8Z"/><path d="M4 20h16"/>',
+  gift: '<rect x="3" y="9" width="18" height="12" rx="2"/><path d="M12 9v12M2 9h20M12 9C4 9 4 3 8 3c2 0 4 3 4 6Zm0 0c8 0 8-6 4-6-2 0-4 3-4 6Z"/>',
+  sparkles: '<path d="m12 3 1.9 6.1L20 11l-6.1 1.9L12 19l-1.9-6.1L4 11l6.1-1.9L12 3ZM5 2l.7 2.3L8 5l-2.3.7L5 8l-.7-2.3L2 5l2.3-.7L5 2ZM19 17l.8 2.2L22 20l-2.2.8L19 23l-.8-2.2L16 20l2.2-.8L19 17Z"/>',
+  mic: '<rect x="9" y="2" width="6" height="13" rx="3"/><path d="M5 10a7 7 0 0 0 14 0M12 17v5m-4 0h8"/>',
+  calendar: '<rect x="3" y="5" width="18" height="16" rx="2"/><path d="M7 3v4M17 3v4M3 10h18M8 14h3M8 17h3"/>',
+  cloud: '<path d="M20 17a4 4 0 0 0-1-7.9A7 7 0 0 0 5.4 10 4 4 0 0 0 6 18h13"/>',
+  shield: '<path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10Z"/><path d="m9 12 2 2 4-4"/>'
+};
+function uiIcon(name, size = 23) {
+  return `<svg class="ui-svg-icon" width="${size}" height="${size}" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">${UI_ICONS[name] || UI_ICONS.music}</svg>`;
+}
+function themedIcon(label) {
+  const key = normalize(label);
+  if (key.includes('inicio')) return 'home';
+  if (key.includes('biblioteca')) return 'book';
+  if (key.includes('adora')) return 'heart';
+  if (key.includes('gozo')) return 'music';
+  if (key.includes('juvenil')) return 'crown';
+  if (key.includes('paitan')) return 'gift';
+  if (key.includes('artista')) return 'mic';
+  if (key.includes('servicio')) return 'calendar';
+  return 'sparkles';
+}
+function iconBadge(label, fallbackIcon = '🎵') {
+  const meta = themeMeta(label, fallbackIcon);
+  return `<span class="icon-badge ${meta.cls}">${uiIcon(themedIcon(label), 28)}</span>`;
 }
 
 // --- Tonalidades ---
@@ -641,36 +993,41 @@ function header(title, sub) {
   const pill = isOnline && !offlineMode
     ? '<span class="pill">● En línea</span>'
     : '<span class="pill" style="background:#fee7e9;color:#b42332">● Sin conexión</span>';
-  return `<div class="topbar"><div class="row"><button class="btn secondary menu-btn" data-action="menu">☰</button><div><h1>${title}</h1><p class="subtitle muted">${sub}</p></div></div>${pill}</div>`;
+  return `<div class="topbar"><div class="row"><button class="btn secondary menu-btn" data-action="menu" aria-label="Abrir menú">☰</button><div><h1>${title}</h1><p class="subtitle muted">${sub}</p></div></div>${pill}</div>`;
 }
 
 function shell(content) {
   const navItems = [
-    { v: 'inicio', label: 'Inicio', icon: '⌂' },
-    { v: 'biblioteca', label: 'Biblioteca completa', icon: '♫' },
+    { v: 'inicio', label: 'Inicio' },
+    { v: 'biblioteca', label: 'Biblioteca completa' },
     ...categories.sort((a, b) => a.orden - b.orden).map(c => ({ v: 'cat:' + c.nombre, label: c.nombre, icon: c.icono })),
-    { v: 'artistas', label: 'Artistas y Bandas', icon: '👤' },
-    { v: 'servicios', label: 'Servicios', icon: '▦' }
+    { v: 'artistas', label: 'Artistas y Bandas' },
+    { v: 'servicios', label: 'Servicios' }
   ];
 
   const offlineBanner = (!isOnline || offlineMode) ? `
-    <div style="background:#fff3cd;color:#856404;padding:10px 14px;border-radius:10px;margin-bottom:14px;font-size:14px">
-      🔴 <b>Sin conexión.</b> Biblioteca local de consulta. Para subir o editar canciones, conéctate a internet.
+    <div class="offline-banner-modern">
+      <div>${iconBadge('otro', '📴')}<div><b>Modo sin conexión activo</b><p class="muted compact">Puedes consultar biblioteca, letras y repertorios guardados. Cuando vuelva internet, podrás sincronizar otra vez.</p></div></div>
     </div>
   ` : '';
 
   app.innerHTML = `
     <div class="shell">
+      ${mobileMenu ? '<button class="mobile-menu-backdrop" data-action="menu" aria-label="Cerrar menú"></button>' : ''}
       <aside class="sidebar ${mobileMenu ? 'open' : ''}">
-        <div class="brand">
-          <span>♫</span>
-          <span>Ministerio<br>de Alabanza<br>Yahweh</span>
+        <div class="brand modern-brand">
+          <div class="brand-mark">${uiIcon('music', 34)}</div>
+          <div class="brand-text">Ministerio<br>de Alabanza<br>Yahweh</div>
         </div>
-        <nav class="nav">
-          ${navItems.map(n => `<button data-nav="${n.v}" class="${view === n.v || view.startsWith(n.v + ':') ? 'active' : ''}">${n.icon} &nbsp; ${escapeHtml(n.label)}</button>`).join('')}
+        <nav class="nav modern-nav">
+          ${navItems.map(n => {
+            const active = view === n.v || view.startsWith(n.v + ':');
+            const meta = themeMeta(n.label, n.icon || '🎵');
+            return `<button data-nav="${n.v}" class="${active ? 'active' : ''}"><span class="nav-icon ${meta.cls}">${uiIcon(themedIcon(n.label), 21)}</span><span>${escapeHtml(n.label)}</span></button>`;
+          }).join('')}
         </nav>
-        <div class="note" style="color:#ffecca;background:#233c54">
-          Sesión protegida. Los archivos nuevos se guardan en Supabase y se comparten con las cuentas autorizadas.
+        <div class="note sidebar-note">
+          ${iconBadge('servicios', '☁️')}<div><b>Sesión protegida</b><br><span>Los archivos nuevos se guardan en Supabase y la biblioteca offline queda lista para ensayos y cultos.</span></div>
         </div>
         <button class="btn secondary logout" data-action="logout">Cerrar sesión</button>
       </aside>
@@ -685,35 +1042,41 @@ function counts(catName) { return songs.filter(s => s.category === catName).leng
 function inicio() {
   const catCards = categories
     .sort((a, b) => a.orden - b.orden)
-    .map(c => `<button class="card" style="background:${c.color};border:0" data-nav="cat:${c.nombre}">
-      <div class="symbol">${c.icono}</div>
-      <h3>${escapeHtml(c.nombre)}</h3>
-      <h2 style="margin:4px 0">${counts(c.nombre)}</h2>
-      <p>Ver canciones →</p>
-    </button>`).join('');
+    .map(c => {
+      const meta = themeMeta(c.nombre, c.icono || '🎵');
+      return `<button class="card category-card ${meta.cls}" data-nav="cat:${c.nombre}">
+        <div class="symbol-wrap">${iconBadge(c.nombre, c.icono || '🎵')}</div>
+        <h3>${escapeHtml(c.nombre)}</h3>
+        <h2 style="margin:4px 0">${counts(c.nombre)}</h2>
+        <p>Ver canciones →</p>
+      </button>`;
+    }).join('');
 
   shell(header('Bienvenido', 'Organiza tus canciones y prepara los servicios.') + `
-    <div class="welcome">
-      <b>Tu biblioteca musical, siempre a mano.</b>
-      <p class="muted">Guarda letras, acordes y repertorios desde tu celular o tablet.</p>
+    <div class="welcome modern-welcome">
+      <div>
+        <b>Tu biblioteca musical, siempre a mano.</b>
+        <p class="muted">Guarda letras, acordes y repertorios desde tu celular o tablet, incluso para usar en culto cuando no haya internet.</p>
+      </div>
+      <div class="welcome-spark" aria-hidden="true">${uiIcon('sparkles', 48)}</div>
       <div class="row">
         <button class="btn" data-action="new-song">+ Agregar canción</button>
         <button class="btn green" data-action="bulk-import">⇧ Importar varios PDF / Word</button>
         <button class="btn secondary" data-action="prepare-offline">⬇ Guardar biblioteca sin internet</button>
       </div>
     </div>
-    <p class="muted compact" style="margin:14px 0 0">
+    <p class="muted compact offline-progress-note" style="margin:14px 0 0">
       📦 Documentos preparados en este dispositivo:
       ${offlineProgressSummary().saved} de ${offlineProgressSummary().total}.
       Puedes reanudar la descarga cuando tengas internet.
     </p>
-    <div class="cards">
+    <div class="cards home-cards">
       ${catCards}
-      <button class="card" data-nav="biblioteca"><div class="symbol">📂</div><h3>Biblioteca completa</h3><h2>${songs.length}</h2><p>PDF, Word e imágenes →</p></button>
-      <button class="card" data-nav="artistas"><div class="symbol">👤</div><h3>Artistas y Bandas</h3><h2>${artists.length}</h2><p>Administrar →</p></button>
-      <button class="card" data-nav="servicios"><div class="symbol">▦</div><h3>Servicios</h3><h2>${services.length}</h2><p>Organizar repertorio →</p></button>
+      <button class="card category-card theme-indigo" data-nav="biblioteca"><div class="symbol-wrap">${iconBadge('biblioteca completa', '🎼')}</div><h3>Biblioteca completa</h3><h2>${songs.length}</h2><p>PDF, Word e imágenes →</p></button>
+      <button class="card category-card theme-cyan" data-nav="artistas"><div class="symbol-wrap">${iconBadge('artistas y bandas', '🎤')}</div><h3>Artistas y Bandas</h3><h2>${artists.length}</h2><p>Administrar →</p></button>
+      <button class="card category-card theme-gold" data-nav="servicios"><div class="symbol-wrap">${iconBadge('servicios', '🗂️')}</div><h3>Servicios</h3><h2>${services.length}</h2><p>Organizar repertorio →</p></button>
     </div>
-    <div class="note">Biblioteca compartida: puedes acceder a las mismas canciones desde otros dispositivos con una cuenta autorizada.</div>
+    <div class="note note-modern">Biblioteca compartida: puedes acceder a las mismas canciones desde otros dispositivos con una cuenta autorizada.</div>
   `);
 }
 
@@ -866,37 +1229,55 @@ function renderArtistCard(a) {
 
 // --- Servicios ---
 function servicios() {
+  const ordered = services.sort((a, b) => (b.date || '').localeCompare(a.date || ''));
+  const normalCount = ordered.filter(x => x.type !== 'evento').length;
+  const eventCount = ordered.filter(x => x.type === 'evento').length;
+  const songCount = ordered.reduce((sum, s) => sum + (s.items?.length || 0), 0);
   shell(header('Servicios', 'Prepara tu repertorio para cada culto o evento.') + `
-    <div class="row between" style="margin-bottom:18px">
-      <strong>${services.length} servicios guardados</strong>
-      <div class="row">
-        <button class="btn" data-action="new-service" data-id="normal">+ Servicio normal</button>
-        <button class="btn green" data-action="new-service" data-id="evento">+ Matrimonio / Evento</button>
+    <section class="panel services-hero">
+      <div class="service-toolbar">
+        <div>
+          <strong class="eyebrow">Panel de repertorios</strong>
+          <h3 class="hero-title">Organiza adoración, gozo y eventos de forma más visual</h3>
+          <p class="muted compact">Crea servicios, ordénalos por momentos y abre la letra al instante durante ensayos o ministración.</p>
+        </div>
+        <div class="row">
+          <button class="btn" data-action="new-service" data-id="normal">+ Servicio normal</button>
+          <button class="btn green" data-action="new-service" data-id="evento">+ Matrimonio / Evento</button>
+        </div>
       </div>
-    </div>
-    <div class="cards">
-      ${services.sort((a, b) => (b.date || '').localeCompare(a.date || '')).map(s => `
-        <section class="card service-card">
+      <div class="service-stats">
+        <article class="stat-card"><span>Total</span><strong>${ordered.length}</strong><small>servicios guardados</small></article>
+        <article class="stat-card"><span>Normales</span><strong>${normalCount}</strong><small>cultos y reuniones</small></article>
+        <article class="stat-card"><span>Eventos</span><strong>${eventCount}</strong><small>bodas y especiales</small></article>
+        <article class="stat-card"><span>Canciones</span><strong>${songCount}</strong><small>en todos los repertorios</small></article>
+      </div>
+    </section>
+    <div class="cards service-grid">
+      ${ordered.map(s => `
+        <section class="card service-card ${s.type === 'evento' ? 'event' : 'normal'}">
+          <div class="service-card-top">
+            <span class="service-type-badge">${s.type === 'evento' ? '💍 Evento especial' : '⛪ Servicio normal'}</span>
+            <span class="service-count">♫ ${(s.items || []).length}</span>
+          </div>
           <h3>${escapeHtml(s.name)}</h3>
-          <p class="muted compact" style="margin:4px 0">
-            ${s.type === 'evento' ? '💍 Evento especial' : '⛪ Servicio normal'}
-          </p>
-          <p>📅 ${escapeHtml(s.date || 'Sin fecha')}<br>♫ ${(s.items || []).length} canciones</p>
-          <div class="row">
-            <button class="btn green" data-action="edit-service" data-id="${s.id}">Ver / Editar</button>
+          <p class="service-meta">📅 ${escapeHtml(s.date || 'Sin fecha')}</p>
+          <p class="muted compact">${escapeHtml(s.description || (s.type === 'evento' ? 'Organiza tus tandas y momentos especiales.' : 'Repertorio principal de ministración.'))}</p>
+          <div class="row service-actions">
+            <button class="btn green" data-action="edit-service" data-id="${s.id}">Abrir panel</button>
             <button class="btn red small" data-action="delete-service" data-id="${s.id}">Borrar</button>
           </div>
         </section>
       `).join('')}
-      <button class="card" data-action="new-service" data-id="normal" style="text-align:center;border:2px dashed #bed3ee;background:#f3f8ff">
+      <button class="card service-create normal" data-action="new-service" data-id="normal">
         <div class="symbol">⛪</div>
         <h3>Crear servicio normal</h3>
-        <p>Culto dominical u otro</p>
+        <p>Culto dominical, vigilia o reunión especial.</p>
       </button>
-      <button class="card" data-action="new-service" data-id="evento" style="text-align:center;border:2px dashed #f0c8de;background:#fff6fa">
+      <button class="card service-create event" data-action="new-service" data-id="evento">
         <div class="symbol">💍</div>
         <h3>Crear matrimonio / evento</h3>
-        <p>Boda, bals, tandas, etc.</p>
+        <p>Boda, concierto, presentación o tanda especial.</p>
       </button>
     </div>
   `);
@@ -925,6 +1306,8 @@ function editService() {
         <strong>Datos del ${isEvent ? 'evento' : 'servicio'}</strong>
         <div class="row">
           <button class="btn secondary" data-nav="servicios">Volver</button>
+          <button class="btn secondary" data-action="export-service-png">Descargar PNG</button>
+          <button class="btn secondary" data-action="export-service-pdf">Descargar PDF</button>
           <button class="btn green" data-action="save-service">Guardar</button>
         </div>
       </div>
@@ -943,6 +1326,16 @@ function editService() {
         </div>
       </div>
 
+      <div class="service-editor-banner">
+        <div>
+          <strong>🎵 Repertorio inteligente</strong>
+          <p class="hint service-help">Ordena tu repertorio por momentos. Pulsa <b>Leer letra</b> para ensayar o presentar; PDF, Word e imágenes también pueden abrirse desde cada canción. ${offlineMode || !navigator.onLine ? '📴 Los cambios se guardan localmente y se sincronizan cuando vuelva la conexión.' : ''}</p>
+        </div>
+        <div class="service-editor-chips">
+          <span class="mini-chip">${isEvent ? 'Evento con secciones' : 'Adoración · Gozo · Ofrenda · Final'}</span>
+          <span class="mini-chip">${s.items.length} canciones</span>
+        </div>
+      </div>
       ${isEvent ? `
         <div class="row between" style="margin-top:24px">
           <h3 style="margin:0">Secciones del evento (${allSections.length})</h3>
@@ -954,10 +1347,10 @@ function editService() {
         const items = s.items.filter(x => x.section === sec);
         const bg = paleta[idx % paleta.length];
         return `
-          <section class="section">
+          <section class="section modern-section">
             <div class="section-header" style="background:${bg}">
               <span>
-                ${isEvent ? '💍' : '⛪'} &nbsp; ${escapeHtml(sec)} <small>(${items.length})</small>
+                ${isEvent ? '💍' : (sec === 'Adoración' ? '🙏' : sec === 'Gozo' ? '🎉' : '⛪')} &nbsp; ${escapeHtml(sec)} <small>(${items.length})</small>
                 ${isEvent ? `
                   <button class="link small" data-action="rename-section" data-id="${escapeHtml(sec)}" style="margin-left:8px" title="Renombrar">✏️</button>
                   <button class="link small" data-action="delete-section" data-id="${escapeHtml(sec)}" style="color:#b42332" title="Eliminar">🗑</button>
@@ -966,20 +1359,27 @@ function editService() {
               <button class="btn secondary small" data-action="add-to-service" data-section="${escapeHtml(sec)}">+ Agregar</button>
             </div>
             <div class="section-body">
-              ${items.length ? items.map(item => {
+              ${items.length ? items.map((item, itemPos) => {
                 const song = songs.find(x => x.id === item.songId);
                 return `
-                  <div class="song-row">
+                  <div class="song-row modern-song-row">
                     <div class="song-title">
-                      <b>${escapeHtml(song?.name || 'Canción eliminada')}</b>
+                      <div class="song-title-main">
+                        <b><span class="song-order">${itemPos + 1}</span> ${escapeHtml(song?.name || 'Canción eliminada')}</b>
+                        ${song ? `<button class="btn green small read-song-btn" data-action="service-read" data-id="${song.id}">📖 Leer letra</button>` : ''}
+                      </div>
+                      <div class="song-row-meta">${song ? escapeHtml(songArtistLabel(song) || song.category || 'Sin artista') : 'Canción no disponible'} · Tono ${escapeHtml(song?.tone || item.tone || 'sin definir')}</div>
                       ${song ? songOfflineBadge(song) : ''}
                       <div class="file-list">${song ? fileButtons(song) : ''}</div>
                     </div>
-                    <select style="width:90px" data-tone="${item.id}">${toneOptions(item.tone)}</select>
-                    <div class="section-actions">
-                      <button class="btn secondary small" data-action="up-item" data-id="${item.id}" title="Subir">↑</button>
-                      <button class="btn secondary small" data-action="down-item" data-id="${item.id}" title="Bajar">↓</button>
-                      <button class="btn red small" data-action="remove-item" data-id="${item.id}" title="Quitar">×</button>
+                    <div class="song-row-side">
+                      <label class="tone-label">Tono</label>
+                      <select class="service-tone-select" data-tone="${item.id}">${toneOptions(item.tone)}</select>
+                      <div class="section-actions">
+                        <button class="btn secondary small" aria-label="Subir canción" data-action="up-item" data-id="${item.id}" title="Subir">↑</button>
+                        <button class="btn secondary small" data-action="down-item" data-id="${item.id}" title="Bajar">↓</button>
+                        <button class="btn red small" data-action="remove-item" data-id="${item.id}" title="Quitar">×</button>
+                      </div>
                     </div>
                   </div>
                 `;
@@ -1034,9 +1434,16 @@ function newSongModal(song) {
         </div>
         <div class="field full manual-editor">
           <label for="song-manual-text">✍️ Escribir letra manualmente (opcional)</label>
-          <p class="hint">Puedes escribir una letra sin subir Word o PDF. La plantilla de dos palomitas aparece automáticamente al visualizarla. Escribe CORO, INTRODUCCIÓN, INSTRUMENTAL, VERSO o PUENTE en líneas independientes para colorearlas.</p>
-          <textarea id="song-manual-text" name="manualLyrics" rows="10" placeholder="INTRODUCCIÓN&#10;&#10;Escribe la letra aquí...&#10;&#10;CORO&#10;&#10;Escribe el coro aquí...">${escapeHtml(s.contenidoTexto || '')}</textarea>
-          <details class="manual-preview-wrap"><summary>👁 Vista previa con las dos palomitas</summary>
+          <p class="hint">Selecciona palabras o varias líneas para aplicar <b>negrita, color o MAYÚSCULAS</b>. La vista previa presenta el resultado sin códigos de formato. También puedes añadir Word, PDF e imágenes.</p>
+          <div class="lyric-toolbar" role="toolbar" aria-label="Formato de letra">
+            <button type="button" class="btn secondary small" data-action="format-lyric" data-id="bold" title="Selecciona texto y aplica negrita"><b>B</b> Negrita</button>
+            <button type="button" class="btn secondary small" data-action="format-lyric" data-id="upper" title="Convierte el texto seleccionado a mayúsculas">⇪ MAYÚSCULAS</button>
+            <label for="lyric-color">Color</label><input type="color" id="lyric-color" value="#2563eb" aria-label="Color de texto seleccionado">
+            <button type="button" class="btn secondary small" data-action="format-lyric" data-id="color">Aplicar color</button>
+            ${['INTRODUCCIÓN','VERSO','PRE CORO','CORO','PUENTE','INSTRUMENTAL','FINAL'].map(x => `<button type="button" class="btn secondary small" data-action="insert-heading" data-id="${x}">${x}</button>`).join('')}
+          </div>
+          <textarea id="song-manual-text" name="manualLyrics" rows="10" placeholder="INTRODUCCIÓN&#10;&#10;Escribe la letra aquí...&#10;&#10;CORO&#10;&#10;Escribe el coro aquí...">${escapeHtml(normalizeLyricMarkup(s.contenidoTexto || ''))}</textarea>
+          <details class="manual-preview-wrap" open><summary>👁 Vista previa con las dos palomas</summary>
             <div id="song-manual-preview" class="manual-lyric-page"></div>
           </details>
           <div class="row" style="margin-top:12px">
@@ -1045,7 +1452,7 @@ function newSongModal(song) {
             </button>
           </div>
         </div>
-        ${[['pdf', 'Letra PDF'], ['word', 'Letra Word'], ['chords', 'Canción con acordes (PDF) — opcional'], ['image', 'Imagen con acordes — opcional']]
+        ${[['pdf', 'Letra PDF'], ['word', 'Letra Word'], ['chords', 'Canción con acordes (PDF) — opcional'], ['image', 'Imagen de letra o acordes — opcional']]
           .map(([k, label]) => `<div class="field upload">
             <label>${label}</label>
             <input type="file" name="${k}" accept="${k === 'pdf' || k === 'chords' ? '.pdf,application/pdf' : k === 'word' ? '.doc,.docx,application/msword,application/vnd.openxmlformats-officedocument.wordprocessingml.document' : 'image/*'}"/>
@@ -1527,12 +1934,19 @@ async function downloadFile(path) {
 
 // --- Login ---
 function loginScreen(message = '') {
+  const saved = getOfflineProfile();
+  const canOffline = !navigator.onLine && !!saved?.id;
   app.innerHTML = `
-    <main class="auth-wrap">
+    <main class="auth-wrap modern-auth">
       <section class="auth-panel">
-        <div class="auth-brand">♫</div>
+        <div class="auth-brand premium-brand">${uiIcon('music', 39)}</div>
         <h1>Ministerio de Alabanza Yahweh</h1>
         <p class="muted">Inicia sesión con tu cuenta autorizada de Supabase.</p>
+        ${canOffline ? `<div class="offline-quick-card">
+          <b>Modo sin conexión disponible</b>
+          <p class="muted compact">Se encontró una biblioteca guardada para <b>${escapeHtml(saved.email || 'tu cuenta')}</b>. Puedes entrar sin internet si ya preparaste la app antes.</p>
+          <button class="btn" data-action="offline-entry">Entrar en modo sin conexión</button>
+        </div>` : ''}
         <form id="login-form">
           <div class="field">
             <label for="login-email">Correo electrónico</label>
@@ -1546,7 +1960,7 @@ function loginScreen(message = '') {
           <button class="btn auth-submit" type="submit">Iniciar sesión</button>
         </form>
         <p class="hint">No hay registro público. Las cuentas se crean desde Supabase.</p>
-        <p class="auth-note">Etapa de nube: las canciones nuevas se guardarán en Supabase.</p>
+        <p class="auth-note">La primera vez debes entrar con internet para preparar el modo offline.</p>
       </section>
     </main>
   `;
@@ -1586,6 +2000,13 @@ async function act(action, id, section) {
     return;
   }
   if (action === 'download-lyrics-word') { downloadLyricsAsWord(); return; }
+  if (action === 'offline-entry') {
+    const saved = getOfflineProfile();
+    if (!saved?.id) { loginScreen('No hay una cuenta offline preparada en este dispositivo.'); return; }
+    currentUser = saved;
+    await refresh();
+    return;
+  }
 
   if (action === 'retry') { await refresh(); return; }
   if (action === 'logout') {
@@ -1599,7 +2020,8 @@ async function act(action, id, section) {
     return;
   }
 
-  if (!['retry','logout','menu','close-modal','toggle-artist','view-file','view-manual','download-file','download-lyrics-word'].includes(action) && !requireInternet()) return;
+  const editableOffline = ['new-service','edit-service','save-service','add-to-service','attach-song','add-section','rename-section','delete-section','up-item','down-item','remove-item','service-read'];
+  if (!['retry','logout','menu','close-modal','toggle-artist','view-file','view-manual','download-file','download-lyrics-word','format-lyric','insert-heading','service-read',...editableOffline].includes(action) && !requireInternet()) return;
 
   if (action === 'menu') { mobileMenu = !mobileMenu; render(); return; }
   if (action === 'new-song') { newSongModal(); return; }
@@ -1614,6 +2036,19 @@ async function act(action, id, section) {
     return;
   }
   if (action === 'view-manual') { manualLyricsViewer(id); return; }
+  if (action === 'service-read') { openSongForReading(id); return; }
+  if (action === 'export-service-png') {
+    const s = services.find(x => x.id === activeService);
+    if (s) { downloadServiceAsPng(s); }
+    return;
+  }
+  if (action === 'export-service-pdf') {
+    const s = services.find(x => x.id === activeService);
+    if (s) { downloadServiceAsPdf(s); }
+    return;
+  }
+  if (action === 'format-lyric') { formatLyricsSelection(id); return; }
+  if (action === 'insert-heading') { insertLyricsHeading(id); return; }
   if (action === 'view-file') { await viewFile(id, section || 'pdf'); return; }
   if (action === 'download-file') { await downloadFile(id); return; }
 
@@ -1656,7 +2091,7 @@ async function act(action, id, section) {
     const s = services.find(x => x.id === activeService);
     await saveFields(s);
     await refresh();
-    toast('Servicio guardado');
+    toast(offlineMode || !navigator.onLine ? 'Repertorio guardado en este dispositivo; se enviará al volver internet.' : 'Servicio guardado');
     return;
   }
   if (action === 'add-to-service') {
@@ -1745,7 +2180,7 @@ function filterAddSongResults() {
 }
 
 document.addEventListener('input', e => {
-  if (e.target.id === 'song-manual-text' || (e.target.name === 'name' && e.target.closest('#song-form'))) updateLyricsPreview();
+  if (e.target.id === 'song-manual-text' || ((e.target.name === 'name' || e.target.name === 'artistId') && e.target.closest('#song-form'))) updateLyricsPreview();
   if (e.target.id === 'search') {
     const val = e.target.value;
     search = val;
@@ -1797,6 +2232,7 @@ document.addEventListener('submit', async e => {
       return;
     }
     currentUser = data.user;
+    saveOfflineProfile(currentUser);
     await refresh();
     return;
   }
@@ -1833,7 +2269,7 @@ document.addEventListener('submit', async e => {
     category: fd.get('category'),
     artistId: String(fd.get('artistId') || '') || null,
     tone: fd.get('tone'),
-    contenidoTexto: String(fd.get('manualLyrics') ?? current?.contenidoTexto ?? ''),
+    contenidoTexto: normalizeLyricMarkup(String(fd.get('manualLyrics') ?? current?.contenidoTexto ?? '')),
     links: {
       youtube: fd.get('youtube'),
       lacuerda: fd.get('lacuerda'),
@@ -1855,7 +2291,7 @@ document.addEventListener('submit', async e => {
 
         if (key === 'pdf' || key === 'word') {
           const texto = await extractText(f);
-          if (texto) s.contenidoTexto = texto;
+          if (texto && !s.contenidoTexto.trim()) s.contenidoTexto = texto;
         }
       }
     }
@@ -1894,8 +2330,18 @@ async function initAuth() {
         const verified = await supa.auth.getUser();
         if (!verified.error && verified.data?.user) currentUser = verified.data.user;
       } catch (e) { console.warn('Sin validación de red, solo consulta local', e); }
+    } else if (!currentUser) {
+      const cached = getOfflineProfile();
+      if (cached?.id) currentUser = cached;
     }
-  } catch (e) { console.warn('No se pudo recuperar la sesión local', e); currentUser = null; }
+    if (currentUser?.id) saveOfflineProfile(currentUser);
+  } catch (e) {
+    console.warn('No se pudo recuperar la sesión local', e);
+    if (!navigator.onLine) {
+      const cached = getOfflineProfile();
+      currentUser = cached?.id ? cached : null;
+    } else currentUser = null;
+  }
   authReady = true;
   await refresh();
   supa.auth.onAuthStateChange((event, session) => {
@@ -1908,6 +2354,7 @@ async function initAuth() {
     }
     const old = currentUser?.id;
     currentUser = session?.user ?? currentUser;
+    if (currentUser?.id) saveOfflineProfile(currentUser);
     if (old !== currentUser?.id) refresh();
     else render();
   });
